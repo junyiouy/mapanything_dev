@@ -2212,6 +2212,7 @@ class FactoredGeometryRegr3D(Criterion, MultiLoss):
         pr_pose_trans = [torch.zeros_like(trans) for trans in no_norm_pr_pose_trans]
 
         # Normalize points
+        # 对非度量预测数据使用距离归一化，对于度量预测数据不进行归一化
         if self.norm_mode and non_metric_scale_mask.any():
             pr_normalization_output = normalize_multiple_pointclouds(
                 [pts[non_metric_scale_mask] for pts in no_norm_pr_pts],
@@ -2249,7 +2250,7 @@ class FactoredGeometryRegr3D(Criterion, MultiLoss):
                 pr_pose_trans[i][non_metric_scale_mask] = no_norm_pr_pose_trans[i][
                     non_metric_scale_mask
                 ]
-
+        # 对度量预测数据和gt使用与gt相同的归一化方式
         if self.norm_mode and not self.gt_scale:
             gt_normalization_output = normalize_multiple_pointclouds(
                 no_norm_gt_pts, valid_masks, self.norm_mode, ret_factor=True

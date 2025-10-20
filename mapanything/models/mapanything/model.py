@@ -1240,7 +1240,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             pose_quats_across_views,
             pose_trans_across_views,
             per_sample_cam_input_mask,
-        )
+        ) # NOTE: 这个是在相机0系里算scale，rotation和translation的特征的，translation还做了标准化
 
         # Normalize the fused features (permute -> normalize -> permute)
         all_encoder_features_across_views = all_encoder_features_across_views.permute(

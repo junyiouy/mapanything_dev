@@ -4,21 +4,20 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 """
-BlendedMVS Dataset using WAI format data.
+Waymo Dataset using WAI format data.
 """
 
 import os
 
-import cv2
 import numpy as np
 
 from mapanything.datasets.base.base_dataset import BaseDataset
 from mapanything.utils.wai.core import load_data, load_frame
 
 
-class BlendedMVSWAI(BaseDataset):
+class WaymoWAI(BaseDataset):
     """
-    BlendedMVS dataset containing object-centric and birds-eye-view scenes.
+    Waymo dataset containing real-world driving scenes.
     """
 
     def __init__(
@@ -53,7 +52,7 @@ class BlendedMVSWAI(BaseDataset):
         self._load_data()
 
         # Define the dataset type flags
-        self.is_metric_scale = False
+        self.is_metric_scale = True  # Waymo is real-world metric scale
         self.is_synthetic = False
 
     def _load_data(self):
@@ -62,7 +61,7 @@ class BlendedMVSWAI(BaseDataset):
         split_metadata_path = os.path.join(
             self.dataset_metadata_dir,
             self.split,
-            f"blendedmvs_scene_list_{self.split}.npy",
+            f"waymo_scene_list_{self.split}.npy",
         )
         split_scene_list = np.load(split_metadata_path, allow_pickle=True)
 
@@ -72,7 +71,55 @@ class BlendedMVSWAI(BaseDataset):
         else:
             self.scenes = [self.specific_scene_name]
         self.num_of_scenes = len(self.scenes)
-
+    
+    @staticmethod
+    def build_manual_covisibility_matrix(num_views_in_scene):
+        """
+        手动构建共可视矩阵
+        Args:
+            num_views_in_scene: 场景中的总view数 (5t)
+        Returns:
+            5t×5t的共可视矩阵
+        """
+        num_timestamps = num_views_in_scene // 5
+        pairwise_covisibility = np.zeros((num_views_in_scene, num_views_in_scene), dtype=np.float32)
+        
+        # 5×5相机内共可视矩阵（同一时间戳）
+        intra_covisibility = np.array([
+            [1.0, 1.0, 1.0, 0.0, 0.0],  # F
+            [1.0, 1.0, 0.0, 1.0, 0.0],  # FL
+            [1.0, 0.0, 1.0, 0.0, 1.0],  # FR
+            [0.0, 1.0, 0.0, 1.0, 0.0],  # SL
+            [0.0, 0.0, 1.0, 0.0, 1.0],  # SR
+        ], dtype=np.float32)
+        
+        for i in range(num_views_in_scene):
+            timestamp_i = i // 5
+            camera_i = i % 5
+            
+            for j in range(num_views_in_scene):
+                timestamp_j = j // 5
+                camera_j = j % 5
+                
+                time_diff = abs(timestamp_i - timestamp_j)
+                
+                if time_diff == 0:
+                    # 同一时间戳内的连接
+                    pairwise_covisibility[i, j] = intra_covisibility[camera_i, camera_j]
+                
+                elif time_diff <= 5:
+                    # 5步以内：不相邻连接（间隔连接）
+                    pass
+                        
+                elif time_diff <= 25:
+                    # 5-25步：仅front相机相邻连接
+                    if camera_i == 0 and camera_j == 0:
+                        pairwise_covisibility[i, j] = 1.0
+                        
+                # 超过25步或不符合条件的保持0.0
+        
+        return pairwise_covisibility
+    
     def _get_views(self, sampled_idx, num_views_to_sample, resolution):
         # Get the scene name of the sampled index
         scene_index = sampled_idx
@@ -86,24 +133,13 @@ class BlendedMVSWAI(BaseDataset):
         scene_file_names = list(scene_meta["frame_names"].keys())
         num_views_in_scene = len(scene_file_names)
 
-        # Load the scene pairwise covisibility mmap
-        covisibility_version_key = "v0"
-        covisibility_map_dir = os.path.join(
-            scene_root, "covisibility", covisibility_version_key
-        )
-        # Assumes only npy file in directory is covisbility map
-        covisibility_map_name = next(
-            f for f in os.listdir(covisibility_map_dir) if f.endswith(".npy")
-        )
-        covisibility_map_path = os.path.join(
-            scene_root, "covisibility", covisibility_version_key, covisibility_map_name
-        )
-        pairwise_covisibility = load_data(covisibility_map_path, "mmap")
-
+        pairwise_covisibility = self.build_manual_covisibility_matrix(num_views_in_scene)
+        
         # Get the indices of the N views in the scene
         view_indices = self._sample_view_indices(
             num_views_to_sample, num_views_in_scene, pairwise_covisibility
         )
+        # import pdb; pdb.set_trace()
 
         # Get the views corresponding to the selected view indices
         views = []
@@ -113,7 +149,7 @@ class BlendedMVSWAI(BaseDataset):
             view_data = load_frame(
                 scene_root,
                 view_file_name,
-                modalities=["image", "depth", "pred_mask/moge2"],
+                modalities=["image", "depth"],
                 scene_meta=scene_meta,
             )
 
@@ -124,32 +160,17 @@ class BlendedMVSWAI(BaseDataset):
             intrinsics = view_data["intrinsics"].numpy().astype(np.float32)
             c2w_pose = view_data["extrinsics"].numpy().astype(np.float32)
 
-            # Ensure that the depthmap has all valid values
+            # Handle incomplete GT depth map - ensure all values are valid
             depthmap = np.nan_to_num(depthmap, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Get the non_ambiguous_mask and ensure it matches image resolution
-            non_ambiguous_mask = view_data["pred_mask/moge2"].numpy().astype(int)
-            non_ambiguous_mask = cv2.resize(
-                non_ambiguous_mask,
-                (image.shape[1], image.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-            # Mask out the GT depth using the non_ambiguous_mask
-            depthmap = np.where(non_ambiguous_mask, depthmap, 0)
-
             # Resize the data to match the desired resolution
-            additional_quantities_to_resize = [non_ambiguous_mask]
-            image, depthmap, intrinsics, additional_quantities_to_resize = (
-                self._crop_resize_if_necessary(
-                    image=image,
-                    resolution=resolution,
-                    depthmap=depthmap,
-                    intrinsics=intrinsics,
-                    additional_quantities=additional_quantities_to_resize,
-                )
+            image, depthmap, intrinsics = self._crop_resize_if_necessary(
+                image=image,
+                resolution=resolution,
+                depthmap=depthmap,
+                intrinsics=intrinsics,
+                additional_quantities=None,
             )
-            non_ambiguous_mask = additional_quantities_to_resize[0]
 
             # Append the view dictionary to the list of views
             views.append(
@@ -158,8 +179,7 @@ class BlendedMVSWAI(BaseDataset):
                     depthmap=depthmap,
                     camera_pose=c2w_pose,  # cam2world
                     camera_intrinsics=intrinsics,
-                    non_ambiguous_mask=non_ambiguous_mask,
-                    dataset="BlendedMVS",
+                    dataset="Waymo",
                     label=scene_name,
                     instance=os.path.join("images", str(view_file_name)),
                 )
@@ -173,12 +193,12 @@ def get_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-rd", "--root_dir", default="/fsx/xrtech/data/blendedmvs", type=str
+        "-rd", "--root_dir", default="/wekafs/ict/junyiouy/map_anything_data/waymo_train", type=str
     )
     parser.add_argument(
         "-dmd",
         "--dataset_metadata_dir",
-        default="/fsx/nkeetha/mapanything_dataset_metadata",
+        default="/wekafs/ict/junyiouy/map-anything/map_anything_dataset/map-anything/mapanything_dataset_metadata",
         type=str,
     )
     parser.add_argument(
@@ -206,7 +226,7 @@ if __name__ == "__main__":
     )  # Options: --headless, --connect, --serve, --addr, --save, --stdout
     args = parser.parse_args()
 
-    dataset = BlendedMVSWAI(
+    dataset = WaymoWAI(
         num_views=args.num_of_views,
         split="train",
         covisibility_thres=0.25,
@@ -217,25 +237,14 @@ if __name__ == "__main__":
         transform="colorjitter+grayscale+gaublur",
         data_norm_type="dinov2",
     )
-    # dataset = BlendedMVSWAI(
-    #     num_views=args.num_of_views,
-    #     split="val",
-    #     covisibility_thres=0.25,
-    #     ROOT=args.root_dir,
-    #     dataset_metadata_dir=args.dataset_metadata_dir,
-    #     resolution=(518, 392),
-    #     seed=777,
-    #     transform="imgnorm",
-    #     data_norm_type="dinov2",
-    # )
     print(dataset.get_stats())
 
     if args.viz:
-        rr.script_setup(args, "BlendedMVS_Dataloader")
+        rr.script_setup(args, "Waymo_Dataloader")
         rr.set_time("stable_time", sequence=0)
         rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
-    sampled_indices = np.random.choice(len(dataset), size=10, replace=False)
+    sampled_indices = np.random.choice(len(dataset), size=5, replace=False)
 
     for num, idx in enumerate(tqdm(sampled_indices)):
         views = dataset[idx]
@@ -311,4 +320,4 @@ if __name__ == "__main__":
                         colors=filtered_pts_col.reshape(-1, 3),
                     ),
                 )
-# python3 mapanything/datasets/wai/blendedmvs.py -rd /wekafs/ict/junyiouy/map_anything_data/blendedmvs --dmd /wekafs/ict/junyiouy/map-anything/map_anything_dataset/map-anything/mapanything_dataset_metadata  --viz --save blendedmvs.rrd --connect False
+# python3 mapanything/datasets/wai/waymo.py --viz --save Waymo_log.rrd --connect False --num_of_views 24
