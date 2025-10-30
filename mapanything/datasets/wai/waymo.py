@@ -84,14 +84,19 @@ class WaymoWAI(BaseDataset):
         num_timestamps = num_views_in_scene // 5
         pairwise_covisibility = np.zeros((num_views_in_scene, num_views_in_scene), dtype=np.float32)
         
+        # # 5×5相机内共可视矩阵（同一时间戳）
+        # intra_covisibility = np.array([
+        #     [1.0, 1.0, 1.0, 0.0, 0.0],  # F
+        #     [1.0, 1.0, 0.0, 1.0, 0.0],  # FL
+        #     [1.0, 0.0, 1.0, 0.0, 1.0],  # FR
+        #     [0.0, 1.0, 0.0, 1.0, 0.0],  # SL
+        #     [0.0, 0.0, 1.0, 0.0, 1.0],  # SR
+        # ], dtype=np.float32)
+
         # 5×5相机内共可视矩阵（同一时间戳）
-        intra_covisibility = np.array([
-            [1.0, 1.0, 1.0, 0.0, 0.0],  # F
-            [1.0, 1.0, 0.0, 1.0, 0.0],  # FL
-            [1.0, 0.0, 1.0, 0.0, 1.0],  # FR
-            [0.0, 1.0, 0.0, 1.0, 0.0],  # SL
-            [0.0, 0.0, 1.0, 0.0, 1.0],  # SR
-        ], dtype=np.float32)
+        intra_covisibility = np.zeros((5, 5), dtype=np.float32)
+        intra_covisibility[0, 0] = 1.0  # F only
+
         
         for i in range(num_views_in_scene):
             timestamp_i = i // 5

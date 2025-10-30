@@ -1,0 +1,20 @@
+# Default inter-chunk fusion configuration
+# Model type for inter-chunk fusion (Options: "cross_attention", "global_attention", "alternating_attention")
+model_type: "global_attention"
+# Model return type (Options: "no_intermediate_features")
+model_return_type: "no_intermediate_features"
+# Custom positional encoding (null for no custom positional encoding)
+custom_positional_encoding: null
+# Module arguments for the inter-chunk fusion transformer
+module_args:
+  # Name of the info sharing module
+  name: "gat_6_layers"
+  # Use random indices within range (1, max_num_views) for positional encoding of non reference views
+  use_rand_idx_pe_for_non_reference_views: False
+  # Size string
+  size: "6_layers"
+  # Depth
+  depth: 6
+  distinguish_ref_and_non_ref_views: False
+  # Flag to indicate whether to use gradient checkpointing
+  gradient_checkpointing: False

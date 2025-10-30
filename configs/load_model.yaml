@@ -1,0 +1,3 @@
+defaults:
+  - model: mapanything_chunked
+  - _self_

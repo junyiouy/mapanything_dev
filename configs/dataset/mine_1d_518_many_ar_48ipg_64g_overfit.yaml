@@ -17,8 +17,9 @@ resolution_val_blendedmvs: ${dataset.resolution_options.518_1_33_ar}
 
 # Training Set
 train_dataset:
-  "+ 26_250 @ ${dataset.waymo_wai.train.dataset_str}"
+  "+ 100 @ ${dataset.waymo_wai.train.dataset_str}"
 
 # Validation Set
 test_dataset:
-  "+ 4_000 @ ${dataset.waymo_wai.val.dataset_str}"
+  "+ 4_000 @ ${dataset.blendedmvs_wai.val.dataset_str}
+  + 4_000 @ ${dataset.waymo_wai.val.dataset_str}"

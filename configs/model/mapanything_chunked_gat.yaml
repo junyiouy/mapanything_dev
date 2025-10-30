@@ -1,0 +1,21 @@
+defaults:
+  - default
+  - encoder: dinov2_large
+  - info_sharing: aat_ifr_24_layers
+  - pred_head: dpt_pose_scale
+  - task: images_only
+  - inter_chunk: gat_6_layers
+
+# String for model factory
+model_str: "mapanything_chunked"
+# Model config
+model_config:
+  name: "mapanything_chunked"
+  encoder_config: ${model.encoder}
+  info_sharing_config: ${model.info_sharing}
+  pred_head_config: ${model.pred_head}
+  geometric_input_config: ${model.task}
+  inter_chunk_config: ${model.inter_chunk}
+  # pretrained_checkpoint_path: /wekafs/ict/junyiouy/map-anything/checkpoints/facebook_map-anything.pth
+# Image Normalization Type
+data_norm_type: ${model.encoder.data_norm_type}
