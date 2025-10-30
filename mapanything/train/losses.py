@@ -2074,7 +2074,7 @@ class FactoredGeometryRegr3D(Criterion, MultiLoss):
         gt_ray_directions = []
         gt_pose_quats = []
         # Predicted quantities
-        if self.convert_predictions_to_view0_frame:
+        if self.convert_predictions_to_view0_frame: # used in pi3, as they don't have first frames as reference; so in our code, we should turn this on
             # Get the camera transform to convert quantities to view0 frame
             pred_camera0 = torch.eye(4, device=preds[0]["cam_quats"].device).unsqueeze(
                 0
