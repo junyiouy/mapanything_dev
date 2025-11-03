@@ -77,7 +77,8 @@ from uniception.models.prediction_heads.dpt import DPTFeature, DPTRegressionProc
 from uniception.models.prediction_heads.linear import LinearFeature
 from uniception.models.prediction_heads.mlp_head import MLPHead
 from uniception.models.prediction_heads.pose_head import PoseHead
-
+from einops import rearrange, repeat, einsum
+import math
 # Enable TF32 precision if supported (for GPU >= Ampere and PyTorch >= 1.12)
 if hasattr(torch.backends.cuda, "matmul") and hasattr(
     torch.backends.cuda.matmul, "allow_tf32"
@@ -218,6 +219,21 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
         # Load pretrained weights
         self._load_pretrained_weights()
+
+        # Initialze pre-fusion modules
+        self._initialize_pre_fusion_modules()
+
+    def _initialize_pre_fusion_modules(self):
+        """
+        Initialize any pre-fusion modules required before the info sharing module.
+        """
+        self.pre_fusion_attn_proj = nn.Linear(self.info_sharing.dim, 32)
+        self.semantic_proj = nn.Linear(self.info_sharing.dim, self.info_sharing.dim)
+
+        # 零初始化self.semantic_proj
+        torch.nn.init.zeros_(self.semantic_proj.weight)
+        torch.nn.init.zeros_(self.semantic_proj.bias)
+        
 
     def _initialize_inter_chunk_fusion(self, inter_chunk_config):
         """
@@ -1776,6 +1792,35 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
+    def _chunk_attn_pooling(self, chunk_features):
+        """chunk_features: Tensor of shape (B, C, V, H, W)
+        
+        Returns:
+            pooled_features: Tensor of shape (B, C, 1)
+        """
+        # 1. reshape to (B, V*H*W, C)
+        B, C, V, H, W = chunk_features.shape
+        chunk_features_reshaped = rearrange(
+            chunk_features, "b c v h w -> b (v h w) c"
+        )
+        # 2. use self.pre_fusion_attn_proj to project to (B, V*H*W, C)
+        chunk_features_proj = self.pre_fusion_attn_proj(chunk_features_reshaped)
+        # 3. apply attention pooling
+        chunk_features_similarity = einsum(chunk_features_proj, chunk_features_proj, "b n c, b m c -> b n m")  # (B, V*H*W, V*H*W)
+        chunk_features_similarity = chunk_features_similarity / math.sqrt(C)
+        chunk_features_attn = torch.nn.functional.softmax(chunk_features_similarity, dim=-1)  # (B, V*H*W, V*H*W)
+        pooled_features = einsum(chunk_features_attn, chunk_features_reshaped, "b n m, b m c -> b n c")  # (B, V*H*W, C)
+        # 4. average pool over the sequence dimension to get (B, 1, C)
+        pooled_features = pooled_features.mean(dim=1,keepdim=True)
+        # 5. use self.semantic_proj 
+        pooled_features = self.semantic_proj(pooled_features) # (B, 1, C)
+        # 6. reshape to (B, C, 1)
+        pooled_features = rearrange(
+            pooled_features, "b 1 c -> b c 1"
+        )
+        return pooled_features
+        
+
     def forward(self, views, num_chunks: int = 1, memory_efficient_inference: bool = False):
         """
         Chunk-based forward pass with inter-chunk fusion:
@@ -1822,7 +1867,6 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
             if num_chunks == num_views:
                 num_chunks = 1
-            num_chunks = 3
             # print(f'Using num_chunks = {num_chunks} for {num_views} views.')
             # 验证输入约束
             assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
@@ -1874,7 +1918,12 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         # 从all_chunk_final_features中提取所有views的features用于fusion
         all_view_features_for_fusion = []
         for chunk_final_features in all_chunk_final_features:
-            all_view_features_for_fusion.extend(chunk_final_features.features)
+            chunk_final_features_stacked = torch.stack(chunk_final_features.features, dim=2)  # (B, C, V, H, W)
+            chunk_semantic_bias = self._chunk_attn_pooling(chunk_final_features_stacked).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1, 1)
+            # 把chunk_semantic_bias加到每个view的feature上
+            chunk_final_features_stacked = chunk_final_features_stacked + chunk_semantic_bias
+            chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_stacked, 'b c v h w -> b c (v h) w')
+            all_view_features_for_fusion.append(chunk_final_features_flatten_to_H_dim)
 
         inter_fusion_input = MultiViewTransformerInput(
             features=all_view_features_for_fusion,  # n个views的features
@@ -1892,7 +1941,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         # Step 3: Pose estimation for each chunk's ref view (第一个view是ref view)
         chunk_ref_poses = []
         for chunk_idx in range(num_chunks):
-            ref_view_idx = chunk_idx * chunk_size  # 每个chunk的第一个view
+            ref_view_idx = chunk_idx # 目前把一个chunk里所有的view都融合了，所以ref view的index就是chunk_idx
             # 用fused_features中对应view的feature来预测这个chunk的pose
             ref_view_feature = fused_features.features[ref_view_idx]  # (B, C, H, W)
 

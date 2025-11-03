@@ -9,13 +9,25 @@ min_lr: 0.0
 submodule_configs:
   # Only train inter-chunk fusion and pose head modules
   inter_chunk_fusion:
-    lr: 2e-04
+    lr: 1e-04
     min_lr: 1e-05
     warmup_epochs: ${train_params.warmup_epochs}
     weight_decay: ${train_params.weight_decay}
     schedule_type: ${train_params.schedule_type}
   inter_chunk_pose_head:
     lr: 2e-04
+    min_lr: 1e-05
+    warmup_epochs: ${train_params.warmup_epochs}
+    weight_decay: ${train_params.weight_decay}
+    schedule_type: ${train_params.schedule_type}
+  pre_fusion_attn_proj:
+    lr: 1e-04
+    min_lr: 1e-05
+    warmup_epochs: ${train_params.warmup_epochs}
+    weight_decay: ${train_params.weight_decay}
+    schedule_type: ${train_params.schedule_type}
+  semantic_proj:
+    lr: 1e-04
     min_lr: 1e-05
     warmup_epochs: ${train_params.warmup_epochs}
     weight_decay: ${train_params.weight_decay}
