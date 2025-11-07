@@ -258,7 +258,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 )
 
         # Add dependencies to inter_chunk_config
-        inter_chunk_config["module_args"]["input_embed_dim"] = self.info_sharing.dim
+        inter_chunk_config["module_args"]["input_embed_dim"] = self.info_sharing.dim + self.encoder.enc_embed_dim
         inter_chunk_config["module_args"]["custom_positional_encoding"] = self.inter_chunk_custom_positional_encoding
         self.inter_chunk_fusion_return_type= inter_chunk_config["model_return_type"]
 
@@ -1888,7 +1888,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                     chunk_encoder_features = self._encode_and_fuse_optional_geometric_inputs(
                         chunk_views, chunk_encoder_features
                     )
-                all_chunk_encoder_features_across_views.append(chunk_encoder_features)
+                all_chunk_encoder_features_across_views.append(chunk_encoder_features) # chunk_encoder_features: list of tensor shape (B,C,H,W), length = chunk_size
 
                 # Per-chunk info sharing
                 input_scale_token = (
@@ -1912,17 +1912,21 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 # 直接收集完整的chunk_final_features结构体和对应的intermediate features
                 all_chunk_final_features.append(chunk_final_features)
                 all_chunk_intermediate_features.append(chunk_intermediate_features)
-            
+        
 
         # Step 2: Inter-chunk fusion - 把所有views的features当作输入
         # 从all_chunk_final_features中提取所有views的features用于fusion
         all_view_features_for_fusion = []
-        for chunk_final_features in all_chunk_final_features:
+        for chunk_final_features,chunk_encoder_features in zip(all_chunk_final_features, all_chunk_encoder_features_across_views):
             chunk_final_features_stacked = torch.stack(chunk_final_features.features, dim=2)  # (B, C, V, H, W)
+            chunk_encoder_features_stacked = torch.stack(chunk_encoder_features, dim=2)  # (B, C, V, H, W)
             chunk_semantic_bias = self._chunk_attn_pooling(chunk_final_features_stacked).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1, 1)
             # 把chunk_semantic_bias加到每个view的feature上
             chunk_final_features_stacked = chunk_final_features_stacked + chunk_semantic_bias
             chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_stacked, 'b c v h w -> b c (v h) w')
+            chunk_encoder_features_flatten_to_H_dim = rearrange(chunk_encoder_features_stacked, 'b c v h w -> b c (v h) w')
+            # concat at channel dim
+            chunk_final_features_flatten_to_H_dim = torch.cat([chunk_final_features_flatten_to_H_dim, chunk_encoder_features_flatten_to_H_dim], dim=1)  # (B, 768 + 1024, V*H, W)
             all_view_features_for_fusion.append(chunk_final_features_flatten_to_H_dim)
 
         inter_fusion_input = MultiViewTransformerInput(
@@ -2328,6 +2332,10 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                         for i in range(num_views_in_chunk):
                             res[i]["non_ambiguous_mask"] = output_masks_per_view[i]
                             res[i]["non_ambiguous_mask_logits"] = output_mask_logits_per_view[i]
+                    # add chunk_idx for loss calculation
+                    for i in range(num_views_in_chunk):
+                        res[i]["chunk_idx"] = chunk_idx
+                    
                 res_list.append(res)
 
 
