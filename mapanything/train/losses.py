@@ -3139,6 +3139,7 @@ class FactoredGeometryScaleRegr3D(Criterion, MultiLoss):
         convert_predictions_to_view0_frame=False,
         compute_world_frame_points_loss=True,
         world_frame_points_loss_weight=1,
+        exclude_chunk_self_loss=False,
     ):
         """
         Initialize the loss criterion for Factored Geometry (Ray Directions, Depth, Pose), Scale
@@ -3195,6 +3196,7 @@ class FactoredGeometryScaleRegr3D(Criterion, MultiLoss):
         self.convert_predictions_to_view0_frame = convert_predictions_to_view0_frame
         self.compute_world_frame_points_loss = compute_world_frame_points_loss
         self.world_frame_points_loss_weight = world_frame_points_loss_weight
+        self.exclude_chunk_self_loss = exclude_chunk_self_loss
 
     def get_all_info(self, batch, preds, dist_clip=None):
         """
@@ -3453,6 +3455,7 @@ class FactoredGeometryScaleRegr3D(Criterion, MultiLoss):
                     "pose_quats": pr_pose_quats[i],
                     "pts3d": pr_pts[i],
                     "pts3d_cam": pr_pts_cam[i],
+                    "chunk_idx": preds[i]["chunk_idx"],
                 }
             )
 
@@ -3835,6 +3838,7 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
         apply_normal_and_gm_loss_to_synthetic_data_only=True,
         normal_loss_weight=1,
         gm_loss_weight=1,
+        exclude_chunk_self_loss=False,
     ):
         """
         Initialize the loss criterion for Ray Directions, Depth, Pose, Pointmaps & Scale.
@@ -3889,6 +3893,7 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
             convert_predictions_to_view0_frame=convert_predictions_to_view0_frame,
             compute_world_frame_points_loss=compute_world_frame_points_loss,
             world_frame_points_loss_weight=world_frame_points_loss_weight,
+            exclude_chunk_self_loss=exclude_chunk_self_loss,
         )
         self.apply_normal_and_gm_loss_to_synthetic_data_only = (
             apply_normal_and_gm_loss_to_synthetic_data_only
@@ -3906,6 +3911,7 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
             pr_metric_norm_factor,
         ) = self.get_all_info(batch, preds, **kw)
         n_views = len(batch)
+        B = batch[0]["pts3d"].shape[0]
 
         # Mask out samples in the batch where the gt depth validity mask is entirely zero
         valid_norm_factor_masks = [
@@ -3932,6 +3938,13 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
         if self.compute_world_frame_points_loss:
             pts3d_losses = []
 
+        valid_loss_mask = torch.ones((n_views,n_views), dtype=torch.bool, device=preds[0]['pts3d'].device)
+        if self.exclude_chunk_self_loss:
+            # pred_info[i]['chunk_idx'] should not be none
+            for i in range(n_views):
+                assert pred_info[i]['chunk_idx'] is not None, "chunk_idx must not be None for loss calculation"
+                for j in range(n_views):
+                    valid_loss_mask[i, j] = pred_info[i]['chunk_idx'] != pred_info[j]['chunk_idx']
         for i in range(n_views):
             # Get the camera frame points, log space depth_z & valid masks
             pred_local_pts3d = pred_info[i]["pts3d_cam"]
@@ -4017,6 +4030,11 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
                     pred_pts3d = apply_log_to_norm(pred_pts3d)
 
             if self.compute_pairwise_relative_pose_loss:
+                cur_valid_loss_mask = valid_loss_mask[i]
+                # exclude self view 
+                cur_valid_loss_mask = torch.cat(
+                    [cur_valid_loss_mask[:i], cur_valid_loss_mask[i+1:]], dim=0
+                )
                 # Get the inverse of current view predicted pose
                 pred_inv_curr_view_pose_quats = quaternion_inverse(
                     pred_info[i]["pose_quats"]
@@ -4102,7 +4120,9 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
                 pose_trans_loss = self.criterion(
                     pred_rel_pose_trans, gt_rel_pose_trans, factor="pose_trans"
                 )
-                pose_trans_loss = pose_trans_loss * self.pose_trans_loss_weight
+                if pose_trans_loss.shape[0] != cur_valid_loss_mask.shape[0]:
+                    cur_valid_loss_mask = cur_valid_loss_mask.repeat(B)
+                pose_trans_loss = pose_trans_loss * self.pose_trans_loss_weight * cur_valid_loss_mask.float()
                 pose_trans_losses.append(pose_trans_loss)
 
                 # Compute pose rotation loss
@@ -4115,7 +4135,7 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
                         pred_rel_pose_quats, -gt_rel_pose_quats, factor="pose_quats"
                     ),
                 )
-                pose_quats_loss = pose_quats_loss * self.pose_quats_loss_weight
+                pose_quats_loss = pose_quats_loss * self.pose_quats_loss_weight * cur_valid_loss_mask.float()
                 pose_quats_losses.append(pose_quats_loss)
             else:
                 # Get the pose info for the current view
