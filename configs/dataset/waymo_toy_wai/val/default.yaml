@@ -1,0 +1,26 @@
+dataset_str:
+  "WaymoToyWai(
+    split='${dataset.waymo_toy_wai.val.split}',
+    resolution=${dataset.waymo_toy_wai.val.dataset_resolution},
+    principal_point_centered=${dataset.waymo_toy_wai.val.principal_point_centered},
+    aug_crop=${dataset.waymo_toy_wai.val.aug_crop},
+    transform='${dataset.waymo_toy_wai.val.transform}',
+    data_norm_type='${dataset.waymo_toy_wai.val.data_norm_type}',
+    ROOT='${dataset.waymo_toy_wai.val.ROOT}',
+    dataset_metadata_dir='${dataset.waymo_toy_wai.val.dataset_metadata_dir}',
+    overfit_num_sets=${dataset.waymo_toy_wai.val.overfit_num_sets},
+    variable_num_views=${dataset.waymo_toy_wai.val.variable_num_views},
+    num_views=${dataset.waymo_toy_wai.val.num_views},
+    covisibility_thres=${dataset.waymo_toy_wai.val.covisibility_thres})"
+split: 'val'
+dataset_resolution: ${dataset.resolution_options.518_1_52_ar}
+principal_point_centered: ${dataset.principal_point_centered}
+aug_crop: 0
+transform: 'imgnorm'
+data_norm_type: ${model.data_norm_type}
+ROOT: ${root_data_dir}/waymo_train_toy
+dataset_metadata_dir: "/wekafs/ict/junyiouy/map-anything/map_anything_dataset/map-anything/mapanything_dataset_metadata/train/waymo_scene_list_train_toy.npy"
+overfit_num_sets: null
+variable_num_views: ${dataset.val.variable_num_views}
+num_views: ${dataset.num_views}
+covisibility_thres: 0.25

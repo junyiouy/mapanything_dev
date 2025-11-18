@@ -15,6 +15,7 @@ defaults:
   - tav2_wb_wai: default
   - unrealstereo4k_wai: default
   - waymo_wai: default
+  - waymo_toy_wai: default
 
 # Training Set, For example: BlendedMVS(split='train', resolution=(512, 384), transform=...)
 train_dataset: ???
