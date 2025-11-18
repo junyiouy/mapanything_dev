@@ -1,7 +1,7 @@
 defaults:
   - default
   - encoder: dinov2_large
-  - info_sharing: aat_ifr_24_layers
+  - info_sharing: aat_ifr_24_layers_no_ref_view
   - pred_head: dpt_pose_scale
   - task: images_only
 

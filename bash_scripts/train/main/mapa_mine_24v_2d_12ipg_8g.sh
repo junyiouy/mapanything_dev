@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the Apache License, Version 2.0
+# found in the LICENSE file in the root directory of this source tree.
+
+NUM_GPUS=$1
+
+
+export OMP_NUM_THREADS=24
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+torchrun --nproc_per_node ${NUM_GPUS} \
+    scripts/train.py \
+    machine=dgx02 \
+    dataset=mine_2d_518_many_ar_48ipg_64g dataset.num_workers=12 \
+    dataset.num_views=24 \
+    loss=overall_loss_weigh_pm_higher \
+    model=mapanything \
+    model/task=aug_training \
+    model.encoder.gradient_checkpointing=true \
+    model.pred_head.gradient_checkpointing=true \
+    model.info_sharing.module_args.gradient_checkpointing=true \
+    model.pretrained='${root_experiments_dir}/mapanything/training/mapa_mine_4v_2d_12ipg_8g/checkpoint-last.pth' \
+    train_params=finetune_with_lower_encoder_lr_64g \
+    train_params.epochs=10 \
+    train_params.resume=true \
+    train_params.warmup_epochs=1 \
+    train_params.keep_freq=20 \
+    train_params.max_num_of_imgs_per_gpu=48 \
+    train_params.accum_iter=4 \
+    hydra.run.dir='${root_experiments_dir}/mapanything/training/mapa_mine_24v_2d_12ipg_8g'

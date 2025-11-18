@@ -311,3 +311,4 @@ if __name__ == "__main__":
                         colors=filtered_pts_col.reshape(-1, 3),
                     ),
                 )
+# python3 mapanything/datasets/wai/blendedmvs.py -rd /wekafs/ict/junyiouy/map_anything_data/blendedmvs --dmd /wekafs/ict/junyiouy/map-anything/map_anything_dataset/map-anything/mapanything_dataset_metadata  --viz --save blendedmvs.rrd --connect False
