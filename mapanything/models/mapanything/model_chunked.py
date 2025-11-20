@@ -1418,19 +1418,23 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 # Transform geometric outputs based on scene representation type
                 if 'pts3d' in view_res:
                     # Transform pointmap from chunk coordinates to world coordinates
-                    pts3d_chunk = view_res['pts3d']  # (B, H, W, 3)
+                    pts3d_chunk = view_res['pts3d'] / \
+                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)  # (B, H, W, 3)
                     pts3d_world = self._transform_points_to_world(
                         pts3d_chunk, chunk_trans, chunk_quats, img_shape
                     )
-                    transformed_view_res['pts3d'] = pts3d_world
+                    transformed_view_res['pts3d'] = pts3d_world * \
+                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)
 
                 if 'ray_origins' in view_res:
                     # Transform ray origins from chunk coordinates to world coordinates
-                    ray_origins_chunk = view_res['ray_origins']  # (B, H, W, 3)
+                    ray_origins_chunk = view_res['ray_origins'] / \
+                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)  # (B, H, W, 3)
                     ray_origins_world = self._transform_points_to_world(
                         ray_origins_chunk, chunk_trans, chunk_quats, img_shape
                     )
-                    transformed_view_res['ray_origins'] = ray_origins_world
+                    transformed_view_res['ray_origins'] = ray_origins_world * \
+                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)
 
 
                 if 'ray_directions' in view_res:
@@ -1451,12 +1455,14 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
                 if 'cam_trans' in view_res:
                     # Transform camera translation from chunk coordinates to world coordinates
-                    cam_trans_chunk = view_res['cam_trans']  # (B, 3)
+                    cam_trans_chunk = view_res['cam_trans'] / \
+                        view_res['metric_scaling_factor']  # (B, 3)
                     cam_quats_chunk = view_res['cam_quats']  # (B, 4)
                     cam_trans_world, cam_quats_world = self._transform_pose_to_world(
                         cam_trans_chunk, cam_quats_chunk, chunk_trans, chunk_quats
                     )
-                    transformed_view_res['cam_trans'] = cam_trans_world
+                    transformed_view_res['cam_trans'] = cam_trans_world * \
+                        view_res['metric_scaling_factor']
                     transformed_view_res['cam_quats'] = cam_quats_world
 
                 transformed_chunk_res.append(transformed_view_res)
@@ -1853,65 +1859,65 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             List[dict]: A list containing the final outputs for all N views.
         """
         # Get input shape of the images, number of views, and batch size per view
-        with torch.no_grad():
-            batch_size_per_view, _, height, width = views[0]["img"].shape
-            img_shape = (int(height), int(width))
-            num_views = len(views)
 
-            # let num_chunks be the first non-one divisor of num_views that is less than or equal to num_chunks starting from 2.
-            if num_views > 1:
-                for nc in range(2, num_views + 1):
-                    if num_views % nc == 0:
-                        num_chunks = nc
-                        break
+        batch_size_per_view, _, height, width = views[0]["img"].shape
+        img_shape = (int(height), int(width))
+        num_views = len(views)
 
-            if num_chunks == num_views:
-                num_chunks = 1
-            # print(f'Using num_chunks = {num_chunks} for {num_views} views.')
-            # 验证输入约束
-            assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
-            chunk_size = num_views // num_chunks
+        # let num_chunks be the first non-one divisor of num_views that is less than or equal to num_chunks starting from 2.
+        if num_views > 1:
+            for nc in range(2, num_views + 1):
+                if num_views % nc == 0:
+                    num_chunks = nc
+                    break
 
-            # Step 1: Per-chunk processing - 收集所有views的完整features结构体
-            all_chunk_final_features = []  # 收集所有chunk的完整final features结构体
-            all_chunk_intermediate_features = []  # 收集每个chunk的intermediate features
-            all_chunk_encoder_features_across_views = []
+        if num_chunks == num_views:
+            num_chunks = 1
+        # print(f'Using num_chunks = {num_chunks} for {num_views} views.')
+        # 验证输入约束
+        assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
+        chunk_size = num_views // num_chunks
 
-            for chunk_idx in range(num_chunks):
-                start_idx = chunk_idx * chunk_size
-                end_idx = (chunk_idx + 1) * chunk_size
-                chunk_views = views[start_idx:end_idx]
+        # Step 1: Per-chunk processing - 收集所有views的完整features结构体
+        all_chunk_final_features = []  # 收集所有chunk的完整final features结构体
+        all_chunk_intermediate_features = []  # 收集每个chunk的intermediate features
+        all_chunk_encoder_features_across_views = []
 
-                # Per-chunk encode + info sharing
-                chunk_encoder_features = self._encode_n_views(chunk_views)
-                with torch.autocast("cuda", enabled=False):
-                    chunk_encoder_features = self._encode_and_fuse_optional_geometric_inputs(
-                        chunk_views, chunk_encoder_features
-                    )
-                all_chunk_encoder_features_across_views.append(chunk_encoder_features) # chunk_encoder_features: list of tensor shape (B,C,H,W), length = chunk_size
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = (chunk_idx + 1) * chunk_size
+            chunk_views = views[start_idx:end_idx]
 
-                # Per-chunk info sharing
-                input_scale_token = (
-                    self.scale_token.unsqueeze(0)
-                    .unsqueeze(-1)
-                    .repeat(batch_size_per_view, 1, 1)
-                )  # (B, C, 1)
-                info_sharing_input = MultiViewTransformerInput(
-                    features=chunk_encoder_features,
-                    additional_input_tokens=input_scale_token,
+            # Per-chunk encode + info sharing
+            chunk_encoder_features = self._encode_n_views(chunk_views)
+            with torch.autocast("cuda", enabled=False):
+                chunk_encoder_features = self._encode_and_fuse_optional_geometric_inputs(
+                    chunk_views, chunk_encoder_features
                 )
-                if self.info_sharing_return_type == "no_intermediate_features":
-                    chunk_final_features = self.info_sharing(info_sharing_input)
-                    chunk_intermediate_features = None
-                elif self.info_sharing_return_type == "intermediate_features":
-                    (
-                        chunk_final_features,
-                        chunk_intermediate_features,
-                    ) = self.info_sharing(info_sharing_input)
+            all_chunk_encoder_features_across_views.append(chunk_encoder_features) # chunk_encoder_features: list of tensor shape (B,C,H,W), length = chunk_size
 
-                # 直接收集完整的chunk_final_features结构体和对应的intermediate features
-                all_chunk_final_features.append(chunk_final_features)
-                all_chunk_intermediate_features.append(chunk_intermediate_features)
+            # Per-chunk info sharing
+            input_scale_token = (
+                self.scale_token.unsqueeze(0)
+                .unsqueeze(-1)
+                .repeat(batch_size_per_view, 1, 1)
+            )  # (B, C, 1)
+            info_sharing_input = MultiViewTransformerInput(
+                features=chunk_encoder_features,
+                additional_input_tokens=input_scale_token,
+            )
+            if self.info_sharing_return_type == "no_intermediate_features":
+                chunk_final_features = self.info_sharing(info_sharing_input)
+                chunk_intermediate_features = None
+            elif self.info_sharing_return_type == "intermediate_features":
+                (
+                    chunk_final_features,
+                    chunk_intermediate_features,
+                ) = self.info_sharing(info_sharing_input)
+
+            # 直接收集完整的chunk_final_features结构体和对应的intermediate features
+            all_chunk_final_features.append(chunk_final_features)
+            all_chunk_intermediate_features.append(chunk_intermediate_features)
         
 
         # Step 2: Inter-chunk fusion - 把所有views的features当作输入
@@ -1961,382 +1967,382 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             )
             chunk_ref_poses.append(chunk_pose_output)
 
-        with torch.no_grad():
-            # Step 4: Per-chunk dense prediction and scale estimation
-            res_list = []
 
-            for chunk_idx, (final_info_sharing_multi_view_feat, intermediate_info_sharing_multi_view_feat, all_encoder_features_across_views) \
-                    in enumerate(zip(all_chunk_final_features, all_chunk_intermediate_features, all_chunk_encoder_features_across_views)):
-                num_views_in_chunk = len(final_info_sharing_multi_view_feat.features)
-                if self.pred_head_type == "linear":
-                    # Stack the features for all views
-                    dense_head_inputs = torch.cat(
+        # Step 4: Per-chunk dense prediction and scale estimation
+        res_list = []
+
+        for chunk_idx, (final_info_sharing_multi_view_feat, intermediate_info_sharing_multi_view_feat, all_encoder_features_across_views) \
+                in enumerate(zip(all_chunk_final_features, all_chunk_intermediate_features, all_chunk_encoder_features_across_views)):
+            num_views_in_chunk = len(final_info_sharing_multi_view_feat.features)
+            if self.pred_head_type == "linear":
+                # Stack the features for all views
+                dense_head_inputs = torch.cat(
+                    final_info_sharing_multi_view_feat.features, dim=0
+                )
+            elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                # Get the list of features for all views
+                dense_head_inputs_list = []
+                if self.use_encoder_features_for_dpt:
+                    # Stack all the image encoder features for all views
+                    stacked_encoder_features = torch.cat(
+                        all_encoder_features_across_views, dim=0
+                    )
+                    dense_head_inputs_list.append(stacked_encoder_features)
+                    # Stack the first intermediate features for all views
+                    stacked_intermediate_features_1 = torch.cat(
+                        intermediate_info_sharing_multi_view_feat[0].features, dim=0
+                    )
+                    dense_head_inputs_list.append(stacked_intermediate_features_1)
+                    # Stack the second intermediate features for all views
+                    stacked_intermediate_features_2 = torch.cat(
+                        intermediate_info_sharing_multi_view_feat[1].features, dim=0
+                    )
+                    dense_head_inputs_list.append(stacked_intermediate_features_2)
+                    # Stack the last layer features for all views
+                    stacked_final_features = torch.cat(
                         final_info_sharing_multi_view_feat.features, dim=0
                     )
+                    dense_head_inputs_list.append(stacked_final_features)
+                else:
+                    # Stack the first intermediate features for all views
+                    stacked_intermediate_features_1 = torch.cat(
+                        intermediate_info_sharing_multi_view_feat[0].features, dim=0
+                    )
+                    dense_head_inputs_list.append(stacked_intermediate_features_1)
+                    # Stack the second intermediate features for all views
+                    stacked_intermediate_features_2 = torch.cat(
+                        intermediate_info_sharing_multi_view_feat[1].features, dim=0
+                    )
+                    dense_head_inputs_list.append(stacked_intermediate_features_2)
+                    # Stack the third intermediate features for all views
+                    stacked_intermediate_features_3 = torch.cat(
+                        intermediate_info_sharing_multi_view_feat[2].features, dim=0
+                    )
+                    dense_head_inputs_list.append(stacked_intermediate_features_3)
+                    # Stack the last layer
+                    stacked_final_features = torch.cat(
+                        final_info_sharing_multi_view_feat.features, dim=0
+                    )
+                    dense_head_inputs_list.append(stacked_final_features)
+            else:
+                raise ValueError(
+                    f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                )
+
+            with torch.autocast("cuda", enabled=False):
+                # Prepare inputs for the downstream heads
+                if self.pred_head_type == "linear":
+                    dense_head_inputs = dense_head_inputs
                 elif self.pred_head_type in ["dpt", "dpt+pose"]:
-                    # Get the list of features for all views
-                    dense_head_inputs_list = []
-                    if self.use_encoder_features_for_dpt:
-                        # Stack all the image encoder features for all views
-                        stacked_encoder_features = torch.cat(
-                            all_encoder_features_across_views, dim=0
+                    dense_head_inputs = dense_head_inputs_list
+                scale_head_inputs = (
+                    final_info_sharing_multi_view_feat.additional_token_features
+                )
+
+                # Run the downstream heads
+                dense_final_outputs, pose_final_outputs, scale_final_output = (
+                    self.downstream_head(
+                        dense_head_inputs=dense_head_inputs,
+                        scale_head_inputs=scale_head_inputs,
+                        img_shape=img_shape,
+                        memory_efficient_inference=memory_efficient_inference,
+                    )
+                )
+
+                # Prepare the final scene representation for all views
+                if self.scene_rep_type in [
+                    "pointmap",
+                    "pointmap+confidence",
+                    "pointmap+mask",
+                    "pointmap+confidence+mask",
+                ]:
+                    output_pts3d = dense_final_outputs.value
+                    # Reshape final scene representation to (B * V, H, W, C)
+                    output_pts3d = output_pts3d.permute(0, 2, 3, 1).contiguous()
+                    # Split the predicted pointmaps back to their respective views
+                    output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
+                    # Pack the output as a list of dictionaries
+                    res = []
+                    for i in range(num_views_in_chunk):
+                        res.append(
+                            {
+                                "pts3d": output_pts3d_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "metric_scaling_factor": scale_final_output,
+                            }
                         )
-                        dense_head_inputs_list.append(stacked_encoder_features)
-                        # Stack the first intermediate features for all views
-                        stacked_intermediate_features_1 = torch.cat(
-                            intermediate_info_sharing_multi_view_feat[0].features, dim=0
+                elif self.scene_rep_type in [
+                    "raymap+depth",
+                    "raymap+depth+confidence",
+                    "raymap+depth+mask",
+                    "raymap+depth+confidence+mask",
+                ]:
+                    # Reshape final scene representation to (B * V, H, W, C)
+                    output_scene_rep = dense_final_outputs.value.permute(
+                        0, 2, 3, 1
+                    ).contiguous()
+                    # Get the predicted ray origins, directions, and depths along rays
+                    output_ray_origins, output_ray_directions, output_depth_along_ray = (
+                        output_scene_rep.split([3, 3, 1], dim=-1)
+                    )
+                    # Get the predicted pointmaps
+                    output_pts3d = (
+                        output_ray_origins + output_ray_directions * output_depth_along_ray
+                    )
+                    # Split the predicted quantities back to their respective views
+                    output_ray_origins_per_view = output_ray_origins.chunk(num_views_in_chunk, dim=0)
+                    output_ray_directions_per_view = output_ray_directions.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_depth_along_ray_per_view = output_depth_along_ray.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
+                    # Pack the output as a list of dictionaries
+                    res = []
+                    for i in range(num_views_in_chunk):
+                        res.append(
+                            {
+                                "pts3d": output_pts3d_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "ray_origins": output_ray_origins_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "ray_directions": output_ray_directions_per_view[i],
+                                "depth_along_ray": output_depth_along_ray_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "metric_scaling_factor": scale_final_output,
+                            }
                         )
-                        dense_head_inputs_list.append(stacked_intermediate_features_1)
-                        # Stack the second intermediate features for all views
-                        stacked_intermediate_features_2 = torch.cat(
-                            intermediate_info_sharing_multi_view_feat[1].features, dim=0
+                elif self.scene_rep_type in [
+                    "raydirs+depth+pose",
+                    "raydirs+depth+pose+confidence",
+                    "raydirs+depth+pose+mask",
+                    "raydirs+depth+pose+confidence+mask",
+                ]:
+                    # Reshape output dense rep to (B * V, H, W, C)
+                    output_dense_rep = dense_final_outputs.value.permute(
+                        0, 2, 3, 1
+                    ).contiguous()
+                    # Get the predicted ray directions and depths along rays
+                    output_ray_directions, output_depth_along_ray = output_dense_rep.split(
+                        [3, 1], dim=-1
+                    )
+                    # Get the predicted camera translations and quaternions
+                    output_cam_translations, output_cam_quats = (
+                        pose_final_outputs.value.split([3, 4], dim=-1)
+                    )
+                    # Get the predicted pointmaps in world frame and camera frame
+                    output_pts3d = (
+                        convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(
+                            output_ray_directions,
+                            output_depth_along_ray,
+                            output_cam_translations,
+                            output_cam_quats,
                         )
-                        dense_head_inputs_list.append(stacked_intermediate_features_2)
-                        # Stack the last layer features for all views
-                        stacked_final_features = torch.cat(
-                            final_info_sharing_multi_view_feat.features, dim=0
+                    )
+                    output_pts3d_cam = output_ray_directions * output_depth_along_ray
+                    # Split the predicted quantities back to their respective views
+                    output_ray_directions_per_view = output_ray_directions.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_depth_along_ray_per_view = output_depth_along_ray.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_cam_translations_per_view = output_cam_translations.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_cam_quats_per_view = output_cam_quats.chunk(num_views_in_chunk, dim=0)
+                    output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
+                    output_pts3d_cam_per_view = output_pts3d_cam.chunk(num_views_in_chunk, dim=0)
+                    # Pack the output as a list of dictionaries
+                    res = []
+                    for i in range(num_views_in_chunk):
+                        res.append(
+                            {
+                                "pts3d": output_pts3d_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "pts3d_cam": output_pts3d_cam_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "ray_directions": output_ray_directions_per_view[i],
+                                "depth_along_ray": output_depth_along_ray_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "cam_trans": output_cam_translations_per_view[i]
+                                * scale_final_output,
+                                "cam_quats": output_cam_quats_per_view[i],
+                                "metric_scaling_factor": scale_final_output,
+                            }
                         )
-                        dense_head_inputs_list.append(stacked_final_features)
-                    else:
-                        # Stack the first intermediate features for all views
-                        stacked_intermediate_features_1 = torch.cat(
-                            intermediate_info_sharing_multi_view_feat[0].features, dim=0
+                elif self.scene_rep_type in [
+                    "campointmap+pose",
+                    "campointmap+pose+confidence",
+                    "campointmap+pose+mask",
+                    "campointmap+pose+confidence+mask",
+                ]:
+                    # Get the predicted camera frame pointmaps
+                    output_pts3d_cam = dense_final_outputs.value
+                    # Reshape final scene representation to (B * V, H, W, C)
+                    output_pts3d_cam = output_pts3d_cam.permute(0, 2, 3, 1).contiguous()
+                    # Get the predicted camera translations and quaternions
+                    output_cam_translations, output_cam_quats = (
+                        pose_final_outputs.value.split([3, 4], dim=-1)
+                    )
+                    # Get the ray directions and depths along rays
+                    output_depth_along_ray = torch.norm(
+                        output_pts3d_cam, dim=-1, keepdim=True
+                    )
+                    output_ray_directions = output_pts3d_cam / output_depth_along_ray
+                    # Get the predicted pointmaps in world frame
+                    output_pts3d = (
+                        convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(
+                            output_ray_directions,
+                            output_depth_along_ray,
+                            output_cam_translations,
+                            output_cam_quats,
                         )
-                        dense_head_inputs_list.append(stacked_intermediate_features_1)
-                        # Stack the second intermediate features for all views
-                        stacked_intermediate_features_2 = torch.cat(
-                            intermediate_info_sharing_multi_view_feat[1].features, dim=0
+                    )
+                    # Split the predicted quantities back to their respective views
+                    output_ray_directions_per_view = output_ray_directions.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_depth_along_ray_per_view = output_depth_along_ray.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_cam_translations_per_view = output_cam_translations.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_cam_quats_per_view = output_cam_quats.chunk(num_views_in_chunk, dim=0)
+                    output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
+                    output_pts3d_cam_per_view = output_pts3d_cam.chunk(num_views_in_chunk, dim=0)
+                    # Pack the output as a list of dictionaries
+                    res = []
+                    for i in range(num_views_in_chunk):
+                        res.append(
+                            {
+                                "pts3d": output_pts3d_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "pts3d_cam": output_pts3d_cam_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "ray_directions": output_ray_directions_per_view[i],
+                                "depth_along_ray": output_depth_along_ray_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "cam_trans": output_cam_translations_per_view[i]
+                                * scale_final_output,
+                                "cam_quats": output_cam_quats_per_view[i],
+                                "metric_scaling_factor": scale_final_output,
+                            }
                         )
-                        dense_head_inputs_list.append(stacked_intermediate_features_2)
-                        # Stack the third intermediate features for all views
-                        stacked_intermediate_features_3 = torch.cat(
-                            intermediate_info_sharing_multi_view_feat[2].features, dim=0
+                elif self.scene_rep_type in [
+                    "pointmap+raydirs+depth+pose",
+                    "pointmap+raydirs+depth+pose+confidence",
+                    "pointmap+raydirs+depth+pose+mask",
+                    "pointmap+raydirs+depth+pose+confidence+mask",
+                ]:
+                    # Reshape final scene representation to (B * V, H, W, C)
+                    output_dense_rep = dense_final_outputs.value.permute(
+                        0, 2, 3, 1
+                    ).contiguous()
+                    # Get the predicted pointmaps, ray directions and depths along rays
+                    output_pts3d, output_ray_directions, output_depth_along_ray = (
+                        output_dense_rep.split([3, 3, 1], dim=-1)
+                    )
+                    # Get the predicted camera translations and quaternions
+                    output_cam_translations, output_cam_quats = (
+                        pose_final_outputs.value.split([3, 4], dim=-1)
+                    )
+                    # Get the predicted pointmaps in camera frame
+                    output_pts3d_cam = output_ray_directions * output_depth_along_ray
+                    # Replace the predicted world-frame pointmaps if required
+                    if self.pred_head_config["adaptor_config"][
+                        "use_factored_predictions_for_global_pointmaps"
+                    ]:
+                        output_pts3d = (
+                            convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(
+                                output_ray_directions,
+                                output_depth_along_ray,
+                                output_cam_translations,
+                                output_cam_quats,
+                            )
                         )
-                        dense_head_inputs_list.append(stacked_intermediate_features_3)
-                        # Stack the last layer
-                        stacked_final_features = torch.cat(
-                            final_info_sharing_multi_view_feat.features, dim=0
+                    # Split the predicted quantities back to their respective views
+                    output_ray_directions_per_view = output_ray_directions.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_depth_along_ray_per_view = output_depth_along_ray.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_cam_translations_per_view = output_cam_translations.chunk(
+                        num_views_in_chunk, dim=0
+                    )
+                    output_cam_quats_per_view = output_cam_quats.chunk(num_views_in_chunk, dim=0)
+                    output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
+                    output_pts3d_cam_per_view = output_pts3d_cam.chunk(num_views_in_chunk, dim=0)
+                    # Pack the output as a list of dictionaries
+                    res = []
+                    for i in range(num_views_in_chunk):
+                        res.append(
+                            {
+                                "pts3d": output_pts3d_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "pts3d_cam": output_pts3d_cam_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "ray_directions": output_ray_directions_per_view[i],
+                                "depth_along_ray": output_depth_along_ray_per_view[i]
+                                * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                                "cam_trans": output_cam_translations_per_view[i]
+                                * scale_final_output,
+                                "cam_quats": output_cam_quats_per_view[i],
+                                "metric_scaling_factor": scale_final_output,
+                            }
                         )
-                        dense_head_inputs_list.append(stacked_final_features)
                 else:
                     raise ValueError(
-                        f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                        f"Invalid scene_rep_type: {self.scene_rep_type}. \
+                        Valid options: ['pointmap', 'raymap+depth', 'raydirs+depth+pose', 'campointmap+pose', 'pointmap+raydirs+depth+pose' \
+                                        'pointmap+confidence', 'raymap+depth+confidence', 'raydirs+depth+pose+confidence', 'campointmap+pose+confidence', 'pointmap+raydirs+depth+pose+confidence' \
+                                        'pointmap+mask', 'raymap+depth+mask', 'raydirs+depth+pose+mask', 'campointmap+pose+mask', 'pointmap+raydirs+depth+pose+mask' \
+                                        'pointmap+confidence+mask', 'raymap+depth+confidence+mask', 'raydirs+depth+pose+confidence+mask', 'campointmap+pose+confidence+mask', 'pointmap+raydirs+depth+pose+confidence+mask']"
                     )
 
-                with torch.autocast("cuda", enabled=False):
-                    # Prepare inputs for the downstream heads
-                    if self.pred_head_type == "linear":
-                        dense_head_inputs = dense_head_inputs
-                    elif self.pred_head_type in ["dpt", "dpt+pose"]:
-                        dense_head_inputs = dense_head_inputs_list
-                    scale_head_inputs = (
-                        final_info_sharing_multi_view_feat.additional_token_features
+                # Get the output confidences for all views (if available) and add them to the result
+                if "confidence" in self.scene_rep_type:
+                    output_confidences = dense_final_outputs.confidence
+                    # Reshape confidences to (B * V, H, W)
+                    output_confidences = (
+                        output_confidences.permute(0, 2, 3, 1).squeeze(-1).contiguous()
                     )
-
-                    # Run the downstream heads
-                    dense_final_outputs, pose_final_outputs, scale_final_output = (
-                        self.downstream_head(
-                            dense_head_inputs=dense_head_inputs,
-                            scale_head_inputs=scale_head_inputs,
-                            img_shape=img_shape,
-                            memory_efficient_inference=memory_efficient_inference,
-                        )
-                    )
-
-                    # Prepare the final scene representation for all views
-                    if self.scene_rep_type in [
-                        "pointmap",
-                        "pointmap+confidence",
-                        "pointmap+mask",
-                        "pointmap+confidence+mask",
-                    ]:
-                        output_pts3d = dense_final_outputs.value
-                        # Reshape final scene representation to (B * V, H, W, C)
-                        output_pts3d = output_pts3d.permute(0, 2, 3, 1).contiguous()
-                        # Split the predicted pointmaps back to their respective views
-                        output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
-                        # Pack the output as a list of dictionaries
-                        res = []
-                        for i in range(num_views_in_chunk):
-                            res.append(
-                                {
-                                    "pts3d": output_pts3d_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "metric_scaling_factor": scale_final_output,
-                                }
-                            )
-                    elif self.scene_rep_type in [
-                        "raymap+depth",
-                        "raymap+depth+confidence",
-                        "raymap+depth+mask",
-                        "raymap+depth+confidence+mask",
-                    ]:
-                        # Reshape final scene representation to (B * V, H, W, C)
-                        output_scene_rep = dense_final_outputs.value.permute(
-                            0, 2, 3, 1
-                        ).contiguous()
-                        # Get the predicted ray origins, directions, and depths along rays
-                        output_ray_origins, output_ray_directions, output_depth_along_ray = (
-                            output_scene_rep.split([3, 3, 1], dim=-1)
-                        )
-                        # Get the predicted pointmaps
-                        output_pts3d = (
-                            output_ray_origins + output_ray_directions * output_depth_along_ray
-                        )
-                        # Split the predicted quantities back to their respective views
-                        output_ray_origins_per_view = output_ray_origins.chunk(num_views_in_chunk, dim=0)
-                        output_ray_directions_per_view = output_ray_directions.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_depth_along_ray_per_view = output_depth_along_ray.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
-                        # Pack the output as a list of dictionaries
-                        res = []
-                        for i in range(num_views_in_chunk):
-                            res.append(
-                                {
-                                    "pts3d": output_pts3d_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "ray_origins": output_ray_origins_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "ray_directions": output_ray_directions_per_view[i],
-                                    "depth_along_ray": output_depth_along_ray_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "metric_scaling_factor": scale_final_output,
-                                }
-                            )
-                    elif self.scene_rep_type in [
-                        "raydirs+depth+pose",
-                        "raydirs+depth+pose+confidence",
-                        "raydirs+depth+pose+mask",
-                        "raydirs+depth+pose+confidence+mask",
-                    ]:
-                        # Reshape output dense rep to (B * V, H, W, C)
-                        output_dense_rep = dense_final_outputs.value.permute(
-                            0, 2, 3, 1
-                        ).contiguous()
-                        # Get the predicted ray directions and depths along rays
-                        output_ray_directions, output_depth_along_ray = output_dense_rep.split(
-                            [3, 1], dim=-1
-                        )
-                        # Get the predicted camera translations and quaternions
-                        output_cam_translations, output_cam_quats = (
-                            pose_final_outputs.value.split([3, 4], dim=-1)
-                        )
-                        # Get the predicted pointmaps in world frame and camera frame
-                        output_pts3d = (
-                            convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(
-                                output_ray_directions,
-                                output_depth_along_ray,
-                                output_cam_translations,
-                                output_cam_quats,
-                            )
-                        )
-                        output_pts3d_cam = output_ray_directions * output_depth_along_ray
-                        # Split the predicted quantities back to their respective views
-                        output_ray_directions_per_view = output_ray_directions.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_depth_along_ray_per_view = output_depth_along_ray.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_cam_translations_per_view = output_cam_translations.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_cam_quats_per_view = output_cam_quats.chunk(num_views_in_chunk, dim=0)
-                        output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
-                        output_pts3d_cam_per_view = output_pts3d_cam.chunk(num_views_in_chunk, dim=0)
-                        # Pack the output as a list of dictionaries
-                        res = []
-                        for i in range(num_views_in_chunk):
-                            res.append(
-                                {
-                                    "pts3d": output_pts3d_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "pts3d_cam": output_pts3d_cam_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "ray_directions": output_ray_directions_per_view[i],
-                                    "depth_along_ray": output_depth_along_ray_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "cam_trans": output_cam_translations_per_view[i]
-                                    * scale_final_output,
-                                    "cam_quats": output_cam_quats_per_view[i],
-                                    "metric_scaling_factor": scale_final_output,
-                                }
-                            )
-                    elif self.scene_rep_type in [
-                        "campointmap+pose",
-                        "campointmap+pose+confidence",
-                        "campointmap+pose+mask",
-                        "campointmap+pose+confidence+mask",
-                    ]:
-                        # Get the predicted camera frame pointmaps
-                        output_pts3d_cam = dense_final_outputs.value
-                        # Reshape final scene representation to (B * V, H, W, C)
-                        output_pts3d_cam = output_pts3d_cam.permute(0, 2, 3, 1).contiguous()
-                        # Get the predicted camera translations and quaternions
-                        output_cam_translations, output_cam_quats = (
-                            pose_final_outputs.value.split([3, 4], dim=-1)
-                        )
-                        # Get the ray directions and depths along rays
-                        output_depth_along_ray = torch.norm(
-                            output_pts3d_cam, dim=-1, keepdim=True
-                        )
-                        output_ray_directions = output_pts3d_cam / output_depth_along_ray
-                        # Get the predicted pointmaps in world frame
-                        output_pts3d = (
-                            convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(
-                                output_ray_directions,
-                                output_depth_along_ray,
-                                output_cam_translations,
-                                output_cam_quats,
-                            )
-                        )
-                        # Split the predicted quantities back to their respective views
-                        output_ray_directions_per_view = output_ray_directions.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_depth_along_ray_per_view = output_depth_along_ray.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_cam_translations_per_view = output_cam_translations.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_cam_quats_per_view = output_cam_quats.chunk(num_views_in_chunk, dim=0)
-                        output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
-                        output_pts3d_cam_per_view = output_pts3d_cam.chunk(num_views_in_chunk, dim=0)
-                        # Pack the output as a list of dictionaries
-                        res = []
-                        for i in range(num_views_in_chunk):
-                            res.append(
-                                {
-                                    "pts3d": output_pts3d_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "pts3d_cam": output_pts3d_cam_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "ray_directions": output_ray_directions_per_view[i],
-                                    "depth_along_ray": output_depth_along_ray_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "cam_trans": output_cam_translations_per_view[i]
-                                    * scale_final_output,
-                                    "cam_quats": output_cam_quats_per_view[i],
-                                    "metric_scaling_factor": scale_final_output,
-                                }
-                            )
-                    elif self.scene_rep_type in [
-                        "pointmap+raydirs+depth+pose",
-                        "pointmap+raydirs+depth+pose+confidence",
-                        "pointmap+raydirs+depth+pose+mask",
-                        "pointmap+raydirs+depth+pose+confidence+mask",
-                    ]:
-                        # Reshape final scene representation to (B * V, H, W, C)
-                        output_dense_rep = dense_final_outputs.value.permute(
-                            0, 2, 3, 1
-                        ).contiguous()
-                        # Get the predicted pointmaps, ray directions and depths along rays
-                        output_pts3d, output_ray_directions, output_depth_along_ray = (
-                            output_dense_rep.split([3, 3, 1], dim=-1)
-                        )
-                        # Get the predicted camera translations and quaternions
-                        output_cam_translations, output_cam_quats = (
-                            pose_final_outputs.value.split([3, 4], dim=-1)
-                        )
-                        # Get the predicted pointmaps in camera frame
-                        output_pts3d_cam = output_ray_directions * output_depth_along_ray
-                        # Replace the predicted world-frame pointmaps if required
-                        if self.pred_head_config["adaptor_config"][
-                            "use_factored_predictions_for_global_pointmaps"
-                        ]:
-                            output_pts3d = (
-                                convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(
-                                    output_ray_directions,
-                                    output_depth_along_ray,
-                                    output_cam_translations,
-                                    output_cam_quats,
-                                )
-                            )
-                        # Split the predicted quantities back to their respective views
-                        output_ray_directions_per_view = output_ray_directions.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_depth_along_ray_per_view = output_depth_along_ray.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_cam_translations_per_view = output_cam_translations.chunk(
-                            num_views_in_chunk, dim=0
-                        )
-                        output_cam_quats_per_view = output_cam_quats.chunk(num_views_in_chunk, dim=0)
-                        output_pts3d_per_view = output_pts3d.chunk(num_views_in_chunk, dim=0)
-                        output_pts3d_cam_per_view = output_pts3d_cam.chunk(num_views_in_chunk, dim=0)
-                        # Pack the output as a list of dictionaries
-                        res = []
-                        for i in range(num_views_in_chunk):
-                            res.append(
-                                {
-                                    "pts3d": output_pts3d_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "pts3d_cam": output_pts3d_cam_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "ray_directions": output_ray_directions_per_view[i],
-                                    "depth_along_ray": output_depth_along_ray_per_view[i]
-                                    * scale_final_output.unsqueeze(-1).unsqueeze(-1),
-                                    "cam_trans": output_cam_translations_per_view[i]
-                                    * scale_final_output,
-                                    "cam_quats": output_cam_quats_per_view[i],
-                                    "metric_scaling_factor": scale_final_output,
-                                }
-                            )
-                    else:
-                        raise ValueError(
-                            f"Invalid scene_rep_type: {self.scene_rep_type}. \
-                            Valid options: ['pointmap', 'raymap+depth', 'raydirs+depth+pose', 'campointmap+pose', 'pointmap+raydirs+depth+pose' \
-                                            'pointmap+confidence', 'raymap+depth+confidence', 'raydirs+depth+pose+confidence', 'campointmap+pose+confidence', 'pointmap+raydirs+depth+pose+confidence' \
-                                            'pointmap+mask', 'raymap+depth+mask', 'raydirs+depth+pose+mask', 'campointmap+pose+mask', 'pointmap+raydirs+depth+pose+mask' \
-                                            'pointmap+confidence+mask', 'raymap+depth+confidence+mask', 'raydirs+depth+pose+confidence+mask', 'campointmap+pose+confidence+mask', 'pointmap+raydirs+depth+pose+confidence+mask']"
-                        )
-
-                    # Get the output confidences for all views (if available) and add them to the result
-                    if "confidence" in self.scene_rep_type:
-                        output_confidences = dense_final_outputs.confidence
-                        # Reshape confidences to (B * V, H, W)
-                        output_confidences = (
-                            output_confidences.permute(0, 2, 3, 1).squeeze(-1).contiguous()
-                        )
-                        # Split the predicted confidences back to their respective views
-                        output_confidences_per_view = output_confidences.chunk(num_views_in_chunk, dim=0)
-                        # Add the confidences to the result
-                        for i in range(num_views_in_chunk):
-                            res[i]["conf"] = output_confidences_per_view[i]
-
-                    # Get the output masks (and logits) for all views (if available) and add them to the result
-                    if "mask" in self.scene_rep_type:
-                        # Get the output masks
-                        output_masks = dense_final_outputs.mask
-                        # Reshape masks to (B * V, H, W)
-                        output_masks = output_masks.permute(0, 2, 3, 1).squeeze(-1).contiguous()
-                        # Threshold the masks at 0.5 to get binary masks (0: ambiguous, 1: non-ambiguous)
-                        output_masks = output_masks > 0.5
-                        # Split the predicted masks back to their respective views
-                        output_masks_per_view = output_masks.chunk(num_views_in_chunk, dim=0)
-                        # Get the output mask logits (for loss)
-                        output_mask_logits = dense_final_outputs.logits
-                        # Reshape mask logits to (B * V, H, W)
-                        output_mask_logits = (
-                            output_mask_logits.permute(0, 2, 3, 1).squeeze(-1).contiguous()
-                        )
-                        # Split the predicted mask logits back to their respective views
-                        output_mask_logits_per_view = output_mask_logits.chunk(num_views_in_chunk, dim=0)
-                        # Add the masks and logits to the result
-                        for i in range(num_views_in_chunk):
-                            res[i]["non_ambiguous_mask"] = output_masks_per_view[i]
-                            res[i]["non_ambiguous_mask_logits"] = output_mask_logits_per_view[i]
-                    # add chunk_idx for loss calculation
+                    # Split the predicted confidences back to their respective views
+                    output_confidences_per_view = output_confidences.chunk(num_views_in_chunk, dim=0)
+                    # Add the confidences to the result
                     for i in range(num_views_in_chunk):
-                        res[i]["chunk_idx"] = chunk_idx
-                    
-                res_list.append(res)
+                        res[i]["conf"] = output_confidences_per_view[i]
+
+                # Get the output masks (and logits) for all views (if available) and add them to the result
+                if "mask" in self.scene_rep_type:
+                    # Get the output masks
+                    output_masks = dense_final_outputs.mask
+                    # Reshape masks to (B * V, H, W)
+                    output_masks = output_masks.permute(0, 2, 3, 1).squeeze(-1).contiguous()
+                    # Threshold the masks at 0.5 to get binary masks (0: ambiguous, 1: non-ambiguous)
+                    output_masks = output_masks > 0.5
+                    # Split the predicted masks back to their respective views
+                    output_masks_per_view = output_masks.chunk(num_views_in_chunk, dim=0)
+                    # Get the output mask logits (for loss)
+                    output_mask_logits = dense_final_outputs.logits
+                    # Reshape mask logits to (B * V, H, W)
+                    output_mask_logits = (
+                        output_mask_logits.permute(0, 2, 3, 1).squeeze(-1).contiguous()
+                    )
+                    # Split the predicted mask logits back to their respective views
+                    output_mask_logits_per_view = output_mask_logits.chunk(num_views_in_chunk, dim=0)
+                    # Add the masks and logits to the result
+                    for i in range(num_views_in_chunk):
+                        res[i]["non_ambiguous_mask"] = output_masks_per_view[i]
+                        res[i]["non_ambiguous_mask_logits"] = output_mask_logits_per_view[i]
+                # add chunk_idx for loss calculation
+                for i in range(num_views_in_chunk):
+                    res[i]["chunk_idx"] = chunk_idx
+                
+            res_list.append(res)
 
 
         # Step 5: Transform chunk outputs to unified world coordinate system

@@ -142,11 +142,13 @@ class WaymoWAI(BaseDataset):
 
         pairwise_covisibility = self.build_manual_covisibility_matrix(num_views_in_scene)
         
-        # Get the indices of the N views in the scene
-        view_indices = self._sample_view_indices(
-            num_views_to_sample, num_views_in_scene, pairwise_covisibility
-        )
+        # # Get the indices of the N views in the scene
+        # view_indices = self._sample_view_indices(
+        #     num_views_to_sample, num_views_in_scene, pairwise_covisibility
+        # )
         # import pdb; pdb.set_trace()
+
+        view_indices = list(range(0, 980, 25))[:num_views_to_sample]
 
         # Get the views corresponding to the selected view indices
         views = []

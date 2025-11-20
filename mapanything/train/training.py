@@ -468,14 +468,253 @@ def train_one_epoch(
             device,
             use_amp=bool(args.train_params.amp),
             amp_dtype=args.train_params.amp_dtype,
-            ret="loss",
+            ret=None,  # Get full result including predictions
         )
-        loss, loss_details = loss_tuple  # criterion returns two values
+        loss_result = loss_tuple["loss"]  # This is (loss, loss_details) tuple from criterion
+        if isinstance(loss_result, tuple):
+            loss, loss_details = loss_result
+        else:
+            loss = loss_result
+            loss_details = {}
+        preds = loss_tuple  # Full result dict containing predictions
         if n_views > 2:
             loss = loss * (
                 2 / n_views
             )  # scale the loss relative to the number of views (base is 2 views)
         loss_value = float(loss)
+
+        # Debug: Save predictions and GT point clouds as PLY files periodically
+        if train_tools.is_main_process() and args.output_dir and data_iter_step % 1000 == 0:  # Save every 1000sh iterations
+            debug_dir = os.path.join(args.output_dir, "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+
+            def save_pointcloud_as_ply(points, colors, filename):
+                """Save point cloud as PLY file with colors."""
+                if points is None or points.numel() == 0:
+                    return
+
+                # Flatten to (N, 3) if needed
+                if points.dim() == 4:  # (B, H, W, 3)
+                    B, H, W, C = points.shape
+                    points = points.view(B * H * W, C)
+                    if colors is not None and colors.dim() == 4:
+                        colors = colors.view(B * H * W, -1)
+
+                # Convert to numpy
+                points_np = points.detach().cpu().numpy()
+                if colors is not None:
+                    colors_np = colors.detach().cpu().numpy()
+                    if colors_np.shape[-1] == 1:  # grayscale
+                        colors_np = np.repeat(colors_np, 3, axis=-1)
+                    elif colors_np.shape[-1] == 3:  # already RGB
+                        pass
+                    else:
+                        colors_np = np.ones_like(points_np) * 128  # default gray
+                else:
+                    colors_np = np.ones_like(points_np) * 128  # default gray
+
+                # Ensure colors are in 0-255 range
+                colors_np = np.clip(colors_np, 0, 255).astype(np.uint8)
+
+                # Write PLY file
+                with open(filename, 'w') as f:
+                    # Header
+                    f.write("ply\n")
+                    f.write("format ascii 1.0\n")
+                    f.write(f"element vertex {len(points_np)}\n")
+                    f.write("property float x\n")
+                    f.write("property float y\n")
+                    f.write("property float z\n")
+                    f.write("property uchar red\n")
+                    f.write("property uchar green\n")
+                    f.write("property uchar blue\n")
+                    f.write("end_header\n")
+
+                    # Data
+                    for point, color in zip(points_np, colors_np):
+                        f.write(f"{point[0]} {point[1]} {point[2]} {int(color[0])} {int(color[1])} {int(color[2])}\n")
+
+            # Check if chunk_idx is available
+            has_chunk_idx = any(preds.get(f"pred{view_idx + 1}", {}).get("chunk_idx") is not None for view_idx in range(n_views))
+
+            if has_chunk_idx:
+                # Group by chunk_idx
+                chunk_pred_points = {}
+                chunk_pred_colors = {}
+                chunk_gt_points = {}
+                chunk_gt_colors = {}
+
+                for view_idx in range(n_views):
+                    pred_key = f"pred{view_idx + 1}"
+                    gt_key = f"view{view_idx + 1}"
+
+                    if pred_key in preds and gt_key in preds:
+                        chunk_idx = preds[pred_key].get("chunk_idx")
+                        if chunk_idx is None:
+                            continue
+
+                        # Initialize chunk lists if not exists
+                        if chunk_idx not in chunk_pred_points:
+                            chunk_pred_points[chunk_idx] = []
+                            chunk_pred_colors[chunk_idx] = []
+                            chunk_gt_points[chunk_idx] = []
+                            chunk_gt_colors[chunk_idx] = []
+
+                        # Get predicted point clouds
+                        pred_pts3d = preds[pred_key].get("pts3d")
+
+                        # Get GT point clouds
+                        gt_pts3d = preds[gt_key].get("pts3d")
+                        gt_valid_mask = preds[gt_key].get("valid_mask")
+
+                        # Get RGB colors from input images using the project's rgb function
+                        from mapanything.utils.image import rgb
+                        img_tensor = batch[view_idx]["img"]  # (B, 3, H, W) normalized
+                        data_norm_type = batch[view_idx]["data_norm_type"][0]
+                        # Use rgb function to properly denormalize (returns 0-1 range)
+                        img_rgb_01 = rgb(img_tensor, data_norm_type)  # (B, H, W, 3) in 0-1 range
+                        # Convert to 0-255 range uint8 for PLY
+                        img_rgb = torch.from_numpy((img_rgb_01 * 255).astype(np.uint8)).to(device)
+
+                        # Collect predicted point clouds
+                        if pred_pts3d is not None:
+                            # Flatten colors to match points
+                            if pred_pts3d.dim() == 4:  # (B, H, W, 3)
+                                B, H, W, _ = pred_pts3d.shape
+                                pred_colors = img_rgb.reshape(B * H * W, 3)
+                                pred_pts3d_flat = pred_pts3d.reshape(B * H * W, 3)
+                            else:
+                                pred_colors = img_rgb.reshape(-1, 3)
+                                pred_pts3d_flat = pred_pts3d.reshape(-1, 3)
+
+                            chunk_pred_points[chunk_idx].append(pred_pts3d_flat)
+                            chunk_pred_colors[chunk_idx].append(pred_colors)
+
+                        # Collect GT point clouds
+                        if gt_pts3d is not None and gt_valid_mask is not None:
+                            # Apply valid mask to points and colors
+                            if gt_valid_mask.dim() == 4:  # (B, H, W, 1)
+                                gt_valid_mask = gt_valid_mask.squeeze(-1)
+
+                            gt_pts3d_masked = gt_pts3d[gt_valid_mask]
+
+                            # Apply mask to colors
+                            if gt_valid_mask.dim() == 3:  # (B, H, W)
+                                B, H, W = gt_valid_mask.shape
+                                gt_colors_masked = img_rgb.reshape(B * H * W, 3)[gt_valid_mask.reshape(-1)]
+                            else:
+                                gt_colors_masked = img_rgb.reshape(-1, 3)[gt_valid_mask.reshape(-1)]
+
+                            chunk_gt_points[chunk_idx].append(gt_pts3d_masked)
+                            chunk_gt_colors[chunk_idx].append(gt_colors_masked)
+
+                # Save point clouds for each chunk
+                for chunk_idx in chunk_pred_points.keys():
+                    # Save predictions for this chunk
+                    if chunk_pred_points[chunk_idx]:
+                        combined_pred_points = torch.cat(chunk_pred_points[chunk_idx], dim=0)
+                        combined_pred_colors = torch.cat(chunk_pred_colors[chunk_idx], dim=0)
+                        pred_filename = f"chunk_{chunk_idx}_pred_epoch_{epoch}_iter_{data_iter_step}.ply"
+                        pred_path = os.path.join(debug_dir, pred_filename)
+                        save_pointcloud_as_ply(combined_pred_points, combined_pred_colors, pred_path)
+                        print(f"Saved chunk {chunk_idx} predicted point clouds to {pred_path}")
+
+                    # Save GT for this chunk
+                    if chunk_gt_points[chunk_idx]:
+                        combined_gt_points = torch.cat(chunk_gt_points[chunk_idx], dim=0)
+                        combined_gt_colors = torch.cat(chunk_gt_colors[chunk_idx], dim=0)
+                        gt_filename = f"chunk_{chunk_idx}_gt_epoch_{epoch}_iter_{data_iter_step}.ply"
+                        gt_path = os.path.join(debug_dir, gt_filename)
+                        save_pointcloud_as_ply(combined_gt_points, combined_gt_colors, gt_path)
+                        print(f"Saved chunk {chunk_idx} GT point clouds to {gt_path}")
+            else:
+                # Fallback: save all views together if no chunk_idx
+                all_pred_points = []
+                all_pred_colors = []
+                all_gt_points = []
+                all_gt_colors = []
+
+                for view_idx in range(n_views):
+                    pred_key = f"pred{view_idx + 1}"
+                    gt_key = f"view{view_idx + 1}"
+
+                    if pred_key in preds and gt_key in preds:
+                        # Get predicted point clouds
+                        pred_pts3d = preds[pred_key].get("pts3d")
+
+                        # Get GT point clouds
+                        gt_pts3d = preds[gt_key].get("pts3d")
+                        gt_valid_mask = preds[gt_key].get("valid_mask")
+
+                        # Get RGB colors from input images using the project's rgb function
+                        from mapanything.utils.image import rgb
+                        img_tensor = batch[view_idx]["img"]  # (B, 3, H, W) normalized
+                        data_norm_type = batch[view_idx]["data_norm_type"][0]
+                        # Use rgb function to properly denormalize (returns 0-1 range)
+                        img_rgb_01 = rgb(img_tensor, data_norm_type)  # (B, H, W, 3) in 0-1 range
+                        # Convert to 0-255 range uint8 for PLY
+                        img_rgb = torch.from_numpy((img_rgb_01 * 255).astype(np.uint8)).to(device)
+
+                        # Collect predicted point clouds
+                        if pred_pts3d is not None:
+                            # Flatten colors to match points
+                            if pred_pts3d.dim() == 4:  # (B, H, W, 3)
+                                B, H, W, _ = pred_pts3d.shape
+                                pred_colors = img_rgb.view(B * H * W, 3)
+                                pred_pts3d_flat = pred_pts3d.view(B * H * W, 3)
+                            else:
+                                pred_colors = img_rgb.view(-1, 3)
+                                pred_pts3d_flat = pred_pts3d.view(-1, 3)
+
+                            all_pred_points.append(pred_pts3d_flat)
+                            all_pred_colors.append(pred_colors)
+
+                        # Collect GT point clouds
+                        if gt_pts3d is not None and gt_valid_mask is not None:
+                            # Apply valid mask to points and colors
+                            if gt_valid_mask.dim() == 4:  # (B, H, W, 1)
+                                gt_valid_mask = gt_valid_mask.squeeze(-1)
+
+                            gt_pts3d_masked = gt_pts3d[gt_valid_mask]
+
+                            # Apply mask to colors
+                            if gt_valid_mask.dim() == 3:  # (B, H, W)
+                                B, H, W = gt_valid_mask.shape
+                                gt_colors_masked = img_rgb.view(B * H * W, 3)[gt_valid_mask.view(-1)]
+                            else:
+                                gt_colors_masked = img_rgb.view(-1, 3)[gt_valid_mask.view(-1)]
+
+                            all_gt_points.append(gt_pts3d_masked)
+                            all_gt_colors.append(gt_colors_masked)
+
+                # Save all predictions in one PLY file
+                if all_pred_points:
+                    combined_pred_points = torch.cat(all_pred_points, dim=0)
+                    combined_pred_colors = torch.cat(all_pred_colors, dim=0)
+                    pred_filename = f"all_pred_epoch_{epoch}_iter_{data_iter_step}.ply"
+                    pred_path = os.path.join(debug_dir, pred_filename)
+                    save_pointcloud_as_ply(combined_pred_points, combined_pred_colors, pred_path)
+                    print(f"Saved all predicted point clouds to {pred_path}")
+
+                # Save all GT in one PLY file
+                if all_gt_points:
+                    combined_gt_points = torch.cat(all_gt_points, dim=0)
+                    combined_gt_colors = torch.cat(all_gt_colors, dim=0)
+                    gt_filename = f"all_gt_epoch_{epoch}_iter_{data_iter_step}.ply"
+                    gt_path = os.path.join(debug_dir, gt_filename)
+                    save_pointcloud_as_ply(combined_gt_points, combined_gt_colors, gt_path)
+                    print(f"Saved all GT point clouds to {gt_path}")
+
+            # Save metadata as text file
+            metadata_filename = f"metadata_epoch_{epoch}_iter_{data_iter_step}.txt"
+            metadata_path = os.path.join(debug_dir, metadata_filename)
+            with open(metadata_path, 'w') as f:
+                f.write(f"Epoch: {epoch}\n")
+                f.write(f"Iteration: {data_iter_step}\n")
+                f.write(f"Loss: {loss_value}\n")
+                f.write(f"Loss Details: {loss_details}\n")
+                f.write(f"Number of views: {n_views}\n")
+            print(f"Saved metadata to {metadata_path}")
 
         if not math.isfinite(loss_value) or (loss_value > 1000):
             print("Loss is {}, stopping training".format(loss_value), force=True)
