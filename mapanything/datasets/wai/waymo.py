@@ -72,58 +72,72 @@ class WaymoWAI(BaseDataset):
             self.scenes = [self.specific_scene_name]
         self.num_of_scenes = len(self.scenes)
     
+    # @staticmethod
+    # def build_manual_covisibility_matrix(num_views_in_scene):
+    #     """
+    #     手动构建共可视矩阵
+    #     Args:
+    #         num_views_in_scene: 场景中的总view数 (5t)
+    #     Returns:
+    #         5t×5t的共可视矩阵
+    #     """
+    #     num_timestamps = num_views_in_scene // 5
+    #     pairwise_covisibility = np.zeros((num_views_in_scene, num_views_in_scene), dtype=np.float32)
+        
+    #     # # 5×5相机内共可视矩阵（同一时间戳）
+    #     # intra_covisibility = np.array([
+    #     #     [1.0, 1.0, 1.0, 0.0, 0.0],  # F
+    #     #     [1.0, 1.0, 0.0, 1.0, 0.0],  # FL
+    #     #     [1.0, 0.0, 1.0, 0.0, 1.0],  # FR
+    #     #     [0.0, 1.0, 0.0, 1.0, 0.0],  # SL
+    #     #     [0.0, 0.0, 1.0, 0.0, 1.0],  # SR
+    #     # ], dtype=np.float32)
+
+    #     # 5×5相机内共可视矩阵（同一时间戳）
+    #     intra_covisibility = np.zeros((5, 5), dtype=np.float32)
+    #     intra_covisibility[0, 0] = 1.0  # F only
+
+        
+    #     for i in range(num_views_in_scene):
+    #         timestamp_i = i // 5
+    #         camera_i = i % 5
+            
+    #         for j in range(num_views_in_scene):
+    #             timestamp_j = j // 5
+    #             camera_j = j % 5
+                
+    #             time_diff = abs(timestamp_i - timestamp_j)
+                
+    #             if time_diff == 0:
+    #                 # 同一时间戳内的连接
+    #                 pairwise_covisibility[i, j] = intra_covisibility[camera_i, camera_j]
+                
+    #             elif time_diff <= 5:
+    #                 # 5步以内：不相邻连接（间隔连接）
+    #                 pass
+                        
+    #             elif time_diff <= 25:
+    #                 # 5-25步：仅front相机相邻连接
+    #                 if camera_i == 0 and camera_j == 0:
+    #                     pairwise_covisibility[i, j] = 1.0
+                        
+    #             # 超过25步或不符合条件的保持0.0
+        
+    #     return pairwise_covisibility
+
+
     @staticmethod
     def build_manual_covisibility_matrix(num_views_in_scene):
-        """
-        手动构建共可视矩阵
-        Args:
-            num_views_in_scene: 场景中的总view数 (5t)
-        Returns:
-            5t×5t的共可视矩阵
-        """
-        num_timestamps = num_views_in_scene // 5
         pairwise_covisibility = np.zeros((num_views_in_scene, num_views_in_scene), dtype=np.float32)
         
-        # # 5×5相机内共可视矩阵（同一时间戳）
-        # intra_covisibility = np.array([
-        #     [1.0, 1.0, 1.0, 0.0, 0.0],  # F
-        #     [1.0, 1.0, 0.0, 1.0, 0.0],  # FL
-        #     [1.0, 0.0, 1.0, 0.0, 1.0],  # FR
-        #     [0.0, 1.0, 0.0, 1.0, 0.0],  # SL
-        #     [0.0, 0.0, 1.0, 0.0, 1.0],  # SR
-        # ], dtype=np.float32)
-
-        # 5×5相机内共可视矩阵（同一时间戳）
-        intra_covisibility = np.zeros((5, 5), dtype=np.float32)
-        intra_covisibility[0, 0] = 1.0  # F only
-
-        
         for i in range(num_views_in_scene):
-            timestamp_i = i // 5
-            camera_i = i % 5
-            
             for j in range(num_views_in_scene):
-                timestamp_j = j // 5
-                camera_j = j % 5
-                
-                time_diff = abs(timestamp_i - timestamp_j)
-                
-                if time_diff == 0:
-                    # 同一时间戳内的连接
-                    pairwise_covisibility[i, j] = intra_covisibility[camera_i, camera_j]
-                
-                elif time_diff <= 5:
-                    # 5步以内：不相邻连接（间隔连接）
-                    pass
-                        
-                elif time_diff <= 25:
-                    # 5-25步：仅front相机相邻连接
-                    if camera_i == 0 and camera_j == 0:
-                        pairwise_covisibility[i, j] = 1.0
-                        
-                # 超过25步或不符合条件的保持0.0
+                time_diff = abs(i - j)
+                if time_diff > 10:  # 前置相机在25个时间步内都连接
+                    pairwise_covisibility[i, j] = 1.0
         
         return pairwise_covisibility
+
     
     def _get_views(self, sampled_idx, num_views_to_sample, resolution):
         # Get the scene name of the sampled index
@@ -136,15 +150,25 @@ class WaymoWAI(BaseDataset):
             os.path.join(scene_root, "scene_meta.json"), "scene_meta"
         )
         scene_file_names = list(scene_meta["frame_names"].keys())
+        scene_file_names = [name for name in scene_file_names if name.endswith("_1")]
         num_views_in_scene = len(scene_file_names)
 
-        pairwise_covisibility = self.build_manual_covisibility_matrix(num_views_in_scene)
+        # ---- deprecated: use random walk sampling ----
+        # pairwise_covisibility = self.build_manual_covisibility_matrix(num_views_in_scene)
         
-        # Get the indices of the N views in the scene
-        view_indices = self._sample_view_indices(
-            num_views_to_sample, num_views_in_scene, pairwise_covisibility
+        # # Get the indices of the N views in the scene
+        # view_indices = self._sample_view_indices(
+        #     num_views_to_sample, num_views_in_scene, pairwise_covisibility
+        # )
+        
+        # directly sample N views randomly without considering covisibility
+        assert num_views_to_sample <= num_views_in_scene, \
+            f"num_views_to_sample ({num_views_to_sample}) should be less than or equal to num_views_in_scene ({num_views_in_scene})"
+        view_indices = np.random.choice(
+            num_views_in_scene, size=num_views_to_sample, replace=False
         )
-        # import pdb; pdb.set_trace()
+        # sort the view indices for consistent ordering
+        view_indices = np.sort(view_indices)
 
         # Get the views corresponding to the selected view indices
         views = []

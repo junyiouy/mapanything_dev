@@ -1,0 +1,3 @@
+input_feature_dim: 7
+num_mlp_layers: 1
+hidden_dim: 1024

@@ -14,6 +14,11 @@ from copy import copy, deepcopy
 
 import einops as ein
 import torch
+import open3d as o3d
+import numpy as np
+from mapanything.utils.image import rgb
+import os
+from PIL import Image
 import torch.nn as nn
 
 from mapanything.utils.geometry import (
@@ -4018,6 +4023,129 @@ class FactoredGeometryScaleRegr3DPlusNormalGMLoss(FactoredGeometryScaleRegr3D):
                     gt_pts3d = gt_info[i]["pts3d"].view(batch_size, -1, pts_dim)
                     pred_pts3d = pred_info[i]["pts3d"].view(batch_size, -1, pts_dim)
                 valid_masks[i] = valid_masks[i].view(batch_size, -1)
+
+            # 保存每个view的gt_pts3d和pred_pts3d为ply，用于调试，命名为debug_gt_view{i}.ply和debug_pred_view{i}.ply
+            # 使用相同的颜色信息，batch[i]['img'][valid_masks[i]]
+            # 保存每个view的gt_pts3d和pred_pts3d为ply，用于调试，命名为debug_gt_view{i}.ply和debug_pred_view{i}.ply
+            # 使用相同的颜色信息，batch[i]['img'][valid_masks[i]]
+            os.makedirs("debug_plys", exist_ok=True)
+            device = gt_pts3d.device
+            img_tensor = batch[i]["img"]  # (B, 3, H, W) normalized
+            data_norm_type = batch[i]["data_norm_type"][0]
+            # Use rgb function to properly denormalize (returns 0-1 range)
+            img_rgb_01 = rgb(img_tensor, data_norm_type)  # (B, H, W, 3) in 0-1 range
+            # Convert to 0-255 range uint8 for PLY
+            img_rgb = torch.from_numpy((img_rgb_01 * 255).astype(np.uint8)).to(device)  # (B, H, W, 3)
+            # Flatten img_rgb to (B, H*W, 3)
+            B, H, W, _ = img_rgb.shape
+            img_rgb_flat = img_rgb.view(B, -1, 3)  # (B, H*W, 3)
+            # Concatenate all batches
+            all_pts_gt = []
+            all_pts_pred = []
+            all_colors = []
+            for b in range(B):
+                valid = valid_masks[i][b]  # (H*W,)
+                pts_gt_b = gt_pts3d[b][valid]  # (num_valid, 3)
+                pts_pred_b = pred_pts3d[b][valid]  # (num_valid, 3)
+                colors_b = img_rgb_flat[b][valid]  # (num_valid, 3)
+                all_pts_gt.append(pts_gt_b)
+                all_pts_pred.append(pts_pred_b)
+                all_colors.append(colors_b)
+            all_pts_gt = torch.cat(all_pts_gt, dim=0).cpu().numpy()
+            all_pts_pred = torch.cat(all_pts_pred, dim=0).detach().cpu().numpy()
+            all_colors = torch.cat(all_colors, dim=0).cpu().numpy()
+            # Create PLY for gt
+            pcd_gt = o3d.geometry.PointCloud()
+            pcd_gt.points = o3d.utility.Vector3dVector(all_pts_gt)
+            pcd_gt.colors = o3d.utility.Vector3dVector(all_colors / 255.0)  # o3d expects 0-1
+            o3d.io.write_point_cloud(f"debug_plys/debug_gt_view{i}.ply", pcd_gt)
+            # Similarly for pred
+            pcd_pred = o3d.geometry.PointCloud()
+            pcd_pred.points = o3d.utility.Vector3dVector(all_pts_pred)
+            pcd_pred.colors = o3d.utility.Vector3dVector(all_colors / 255.0)
+            o3d.io.write_point_cloud(f"debug_plys/debug_pred_view{i}.ply", pcd_pred)
+
+            # 同时把对应的图片也保存下来
+            # 同时把对应的图片也保存下来
+            for b in range(B):
+                img_pil = Image.fromarray((img_rgb_01[b] * 255).astype(np.uint8))
+                img_pil.save(f"debug_plys/debug_img_view{i}_batch{b}.png")
+                # 我还希望以合适的可视化形式和，以ply文件可视化的形式把预测的和gt的相机外参分别保存下来
+                # 我还希望以合适的可视化形式和，以ply文件可视化的形式把预测的和gt的相机外参分别保存下来
+                # 保存相机外参：计算相机中心并保存为ply文件，包括XYZ轴
+                scale = 1.0  # 轴的长度缩放因子
+                num_points_per_axis = 10  # 每个轴上的点数，用于模拟线段
+                for b in range(B):
+                    for view_idx in range(n_views):
+                        all_points_gt = []
+                        all_colors_gt = []
+                        all_points_pred = []
+                        all_colors_pred = []
+                        
+                        # GT相机中心和旋转矩阵
+                        R_gt = quaternion_to_rotation_matrix(gt_info[view_idx]["pose_quats"][b])
+                        t_gt = gt_info[view_idx]["pose_trans"][b]
+                        c_gt = t_gt  # 由于pose是w2c，相机中心是t
+                        
+                        # X轴 (红色)
+                        x_axis_end_gt = c_gt + R_gt[:, 0] * scale
+                        for j in range(num_points_per_axis):
+                            point = c_gt + (x_axis_end_gt - c_gt) * (j / (num_points_per_axis - 1))
+                            all_points_gt.append(point.cpu().numpy())
+                            all_colors_gt.append([1, 0, 0])  # 红色
+                        
+                        # Y轴 (绿色)
+                        y_axis_end_gt = c_gt + R_gt[:, 1] * scale
+                        for j in range(num_points_per_axis):
+                            point = c_gt + (y_axis_end_gt - c_gt) * (j / (num_points_per_axis - 1))
+                            all_points_gt.append(point.cpu().numpy())
+                            all_colors_gt.append([0, 1, 0])  # 绿色
+                        
+                        # Z轴 (蓝色)
+                        z_axis_end_gt = c_gt + R_gt[:, 2] * scale
+                        for j in range(num_points_per_axis):
+                            point = c_gt + (z_axis_end_gt - c_gt) * (j / (num_points_per_axis - 1))
+                            all_points_gt.append(point.cpu().numpy())
+                            all_colors_gt.append([0, 0, 1])  # 蓝色
+                        
+                        # Pred相机中心和旋转矩阵
+                        R_pred = quaternion_to_rotation_matrix(pred_info[view_idx]["pose_quats"][b])
+                        t_pred = pred_info[view_idx]["pose_trans"][b]
+                        c_pred = t_pred  # 由于pose是w2c，相机中心是t
+                        
+                        # X轴 (红色)
+                        x_axis_end_pred = c_pred + R_pred[:, 0] * scale
+                        for j in range(num_points_per_axis):
+                            point = c_pred + (x_axis_end_pred - c_pred) * (j / (num_points_per_axis - 1))
+                            all_points_pred.append(point.detach().cpu().numpy())
+                            all_colors_pred.append([1, 0, 0])  # 红色
+                        
+                        # Y轴 (绿色)
+                        y_axis_end_pred = c_pred + R_pred[:, 1] * scale
+                        for j in range(num_points_per_axis):
+                            point = c_pred + (y_axis_end_pred - c_pred) * (j / (num_points_per_axis - 1))
+                            all_points_pred.append(point.detach().cpu().numpy())
+                            all_colors_pred.append([0, 1, 0])  # 绿色
+                        
+                        # Z轴 (蓝色)
+                        z_axis_end_pred = c_pred + R_pred[:, 2] * scale
+                        for j in range(num_points_per_axis):
+                            point = c_pred + (z_axis_end_pred - c_pred) * (j / (num_points_per_axis - 1))
+                            all_points_pred.append(point.detach().cpu().numpy())
+                            all_colors_pred.append([0, 0, 1])  # 蓝色
+                        
+                        # 创建GT的PointCloud并保存
+                        pcd_gt_axes = o3d.geometry.PointCloud()
+                        pcd_gt_axes.points = o3d.utility.Vector3dVector(all_points_gt)
+                        pcd_gt_axes.colors = o3d.utility.Vector3dVector(all_colors_gt)
+                        o3d.io.write_point_cloud(f"debug_plys/debug_gt_cameras_axes_batch{b}_view{view_idx}.ply", pcd_gt_axes)
+                        
+                        # 创建Pred的PointCloud并保存
+                        pcd_pred_axes = o3d.geometry.PointCloud()
+                        pcd_pred_axes.points = o3d.utility.Vector3dVector(all_points_pred)
+                        pcd_pred_axes.colors = o3d.utility.Vector3dVector(all_colors_pred)
+                        o3d.io.write_point_cloud(f"debug_plys/debug_pred_cameras_axes_batch{b}_view{view_idx}.ply", pcd_pred_axes)
+
 
             # Apply loss in log space for depth if specified
             if self.loss_in_log:

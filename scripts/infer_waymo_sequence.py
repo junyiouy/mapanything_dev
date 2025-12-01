@@ -456,6 +456,7 @@ def main():
         args.modalities,
         not args.no_metric_scale
     )
+    views = views[::5]
     if len(views) == 0:
         print("No views found! Check camera types and sequence data.")
         return
