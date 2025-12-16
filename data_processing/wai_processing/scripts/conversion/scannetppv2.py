@@ -245,8 +245,8 @@ def convert_scene(
 
     org_scene_root = Path(cfg.original_root) / scene_name
     org2wai = {
-        "resized_images": "images_distorted",
-        "resized_anon_masks": "anon_masks_distorted",
+        "resized_undistorted_images": "images",
+        "resized_anon_masks": "anon_masks",
     }
 
     logger.info(f"{scene_name}: Processing")
@@ -257,7 +257,7 @@ def convert_scene(
     with open(cfg.test_split_fn, "r", encoding="utf-8") as f:
         test_scene_names = [line.strip() for line in f.readlines()]
 
-    transforms_fn = Path(org_scene_root) / modality / "nerfstudio" / "transforms.json"
+    transforms_fn = Path(org_scene_root) / modality / "nerfstudio" / "transforms_undistorted.json"
     meta = load_data(transforms_fn)
     if scene_name not in test_scene_names:
         frames = meta["frames"] + meta["test_frames"]
@@ -271,7 +271,7 @@ def convert_scene(
     eval_frame_names = []
     wai_frames = []
 
-    image_out_path = out_path / org2wai["resized_images"]
+    image_out_path = out_path / org2wai["resized_undistorted_images"]
     image_out_path.mkdir(parents=True, exist_ok=True)
 
     has_mask = Path(org_scene_root, modality, "resized_anon_masks").exists()
@@ -284,9 +284,9 @@ def convert_scene(
         wai_frame = {"frame_name": frame_name}
         org_transform_matrix = np.array(frame["transform_matrix"]).astype(np.float32)
         opencv_pose, gl2cv_cmat = gl2cv(org_transform_matrix, return_cmat=True)
-        # link distorted images
+        # link undistorted images
         source_image_path = Path(
-            org_scene_root, modality, "resized_images", frame["file_path"]
+            org_scene_root, modality, "resized_undistorted_images", frame["file_path"]
         )
         if not source_image_path.exists():
             if frame["file_path"] in test_frames:
@@ -294,9 +294,9 @@ def convert_scene(
                 continue
             else:
                 raise FileNotFoundError(f"Source path missing: {source_image_path}")
-        target_image_path = f"{org2wai['resized_images']}/{frame_name}.jpg"
+        target_image_path = f"{org2wai['resized_undistorted_images']}/{frame_name}.jpg"
         os.symlink(source_image_path, out_path / target_image_path)
-        wai_frame["image_distorted"] = target_image_path
+        wai_frame["image"] = target_image_path
         wai_frame["file_path"] = target_image_path
 
         # link anon_mask
@@ -313,7 +313,7 @@ def convert_scene(
             else:
                 target_mask_path = f"{org2wai['resized_anon_masks']}/{frame_name}.png"
                 os.symlink(source_mask_path, out_path / target_mask_path)
-                wai_frame["anon_mask_distorted"] = target_mask_path
+                wai_frame["anon_mask"] = target_mask_path
 
         wai_frame["transform_matrix"] = opencv_pose.tolist()
 
@@ -345,9 +345,9 @@ def convert_scene(
         "scale_type": "metric",
         "frames": wai_frames,
         "frame_modalities": {
-            "image_distorted": {"frame_key": "image_distorted", "format": "image"},
-            "anon_mask_distorted": {
-                "frame_key": "anon_mask_distorted",
+            "image": {"frame_key": "image", "format": "image"},
+            "anon_mask": {
+                "frame_key": "anon_mask",
                 "format": "binary",
             },
         },
@@ -514,7 +514,7 @@ def convert_scene(
     scene_meta["_applied_transform"] = gl2cv_cmat.tolist()
     scene_meta["_applied_transforms"] = {"opengl2opencv": gl2cv_cmat.tolist()}
     # save updated scene meta
-    store_data(out_path / "scene_meta_distorted.json", scene_meta, "scene_meta")
+    store_data(out_path / "scene_meta.json", scene_meta, "scene_meta")
 
 
 if __name__ == "__main__":

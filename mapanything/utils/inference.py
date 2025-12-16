@@ -474,6 +474,10 @@ def postprocess_model_outputs_for_inference(
 
                 # Add mask to processed output
                 processed_output["mask"] = final_mask_torch
+        else:
+            processed_output["mask"] = torch.ones_like(
+                processed_output["pts3d"][..., :1], dtype=torch.bool
+            )
 
         processed_outputs.append(processed_output)
 

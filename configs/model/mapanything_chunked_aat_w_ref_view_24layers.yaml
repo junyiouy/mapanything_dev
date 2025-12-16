@@ -4,7 +4,7 @@ defaults:
   - info_sharing: aat_ifr_24_layers
   - pred_head: dpt_pose_scale
   - task: images_only
-  - inter_chunk: aat_6_layers_w_ref_view
+  - inter_chunk: aat_24_layers_w_ref_view
 
 # String for model factory
 model_str: "mapanything_chunked"

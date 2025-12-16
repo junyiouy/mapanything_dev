@@ -106,7 +106,7 @@ def script_add_rerun_args(parser: ArgumentParser) -> None:
         type=str2bool,
         nargs="?",
         const=True,
-        default=True,
+        default=False,
         help="Connect to an external viewer",
     )
     parser.add_argument(

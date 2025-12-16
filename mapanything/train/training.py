@@ -135,6 +135,9 @@ def train(args):
         )
         print(model.load_state_dict(ckpt["model"], strict=False))
         del ckpt  # in case it occupies memory
+        if hasattr(model,'_copy_specific_weights'):
+            model._copy_specific_weights()
+            print("Copied specific weights as defined in the model.")
 
     # Init model for DDP training
     if args.distributed.distributed:
@@ -214,6 +217,7 @@ def train(args):
     last_ckpt_fname = os.path.join(args.output_dir, "checkpoint-last.pth")
     if args.train_params.resume and os.path.isfile(last_ckpt_fname):
         args.train_params.resume_ckpt = last_ckpt_fname
+        print(f"Resuming from last checkpoint: {args.train_params.resume_ckpt}")
     else:
         args.train_params.resume_ckpt = None
     best_so_far = train_tools.load_model(

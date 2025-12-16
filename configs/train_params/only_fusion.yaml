@@ -32,6 +32,24 @@ submodule_configs:
     warmup_epochs: ${train_params.warmup_epochs}
     weight_decay: ${train_params.weight_decay}
     schedule_type: ${train_params.schedule_type}
+  chunk_first_view_embedding:
+    lr: 1e-05
+    min_lr: 1e-06
+    warmup_epochs: ${train_params.warmup_epochs}
+    weight_decay: ${train_params.weight_decay}
+    schedule_type: ${train_params.schedule_type}
+  fusion_scale_token:
+    lr: 1e-05
+    min_lr: 1e-06
+    warmup_epochs: ${train_params.warmup_epochs}
+    weight_decay: ${train_params.weight_decay}
+    schedule_type: ${train_params.schedule_type} 
+  chunk_view_embedding:
+    lr: 1e-05
+    min_lr: 1e-06
+    warmup_epochs: ${train_params.warmup_epochs}
+    weight_decay: ${train_params.weight_decay}
+    schedule_type: ${train_params.schedule_type}
 
 # Enable warnings for parameters not in any submodule
 warn_not_in_submodule: True

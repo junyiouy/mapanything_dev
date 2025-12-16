@@ -8,14 +8,14 @@ custom_positional_encoding: null
 # Module arguments for the inter-chunk fusion transformer
 module_args:
   # Name of the info sharing module
-  name: "aat_6_layers"
+  name: "aat_24_layers"
   # Use random indices within range (1, max_num_views) for positional encoding of non reference views
   # use_rand_idx_pe_for_non_reference_views: True
   use_pe_for_non_reference_views: True
   # Size string
-  size: "6_layers"
+  size: "24_layers"
   # Depth
-  depth: 6
+  depth: 24
   distinguish_ref_and_non_ref_views: True
   # Flag to indicate whether to use gradient checkpointing
   gradient_checkpointing: False

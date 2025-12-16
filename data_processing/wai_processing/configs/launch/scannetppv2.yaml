@@ -8,6 +8,8 @@ scenes_per_job: 20
 conda_env: # pass the name of our conda environment
 nodelist:
 
+num_workers: 16
+
 stages:
   conversion:
     script: conversion/scannetppv2.py
@@ -16,6 +18,10 @@ stages:
   undistortion:
     script: undistort.py
     config: undistortion/scannetppv2.yaml
+  rendering:
+    script: run_rendering.py
+    config: rendering.yaml
+    gpus: 1
   covisibility:
     script: covisibility.py
     config: covisibility/covisibility_gt_depth.yaml

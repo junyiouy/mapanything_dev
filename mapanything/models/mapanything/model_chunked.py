@@ -98,7 +98,6 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         pred_head_config: Dict,
         geometric_input_config: Dict,
         inter_chunk_config: Dict = None,
-        view_pose_config: Dict = None,
         fusion_norm_layer: Union[Type[nn.Module], Callable[..., nn.Module]] = partial(
             nn.LayerNorm, eps=1e-6
         ),
@@ -206,9 +205,6 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         self.scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim))
         torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
 
-        # Initialize the view pose config
-        self.view_pose_config = view_pose_config
-
         # Initialize the info sharing module (multi-view transformer)
         self._initialize_info_sharing(info_sharing_config)
 
@@ -238,25 +234,16 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         torch.nn.init.zeros_(self.semantic_proj.weight)
         torch.nn.init.zeros_(self.semantic_proj.bias)
 
-        # Initialize chunk ID embedding for positional encoding
-        self.chunk_id_embedding = nn.Embedding(100, self.info_sharing.dim + self.encoder.enc_embed_dim)
-        torch.nn.init.trunc_normal_(self.chunk_id_embedding.weight, std=0.02)
+        # # nn.Parameter 用于每个chunk中第一个view的单独编码
+        # self.chunk_first_view_embedding = nn.Parameter(torch.zeros(self.info_sharing.dim+self.encoder.enc_embed_dim))
+        # self.fusion_scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim+self.info_sharing.dim))
+        # torch.nn.init.trunc_normal_(self.fusion_scale_token, std=0.02)
 
-        # Initialize view pose encoder if config provided
-        if hasattr(self, 'view_pose_config') and self.view_pose_config is not None:
-            self.view_pose_encoder = MLPHead(output_dim=self.info_sharing.dim+self.encoder.enc_embed_dim,
-                                             **self.view_pose_config)
-            # Initialize weights
-            torch.nn.init.trunc_normal_(self.view_pose_encoder.proj.weight, std=0.02)
-            torch.nn.init.zeros_(self.view_pose_encoder.proj.bias)
-            torch.nn.init.trunc_normal_(self.view_pose_encoder.output_proj.weight, std=0.02)
-            torch.nn.init.zeros_(self.view_pose_encoder.output_proj.bias)
-            for mlp_layer in self.view_pose_encoder.mlp:
-                for layer in mlp_layer:
-                    if isinstance(layer, nn.Linear):
-                        torch.nn.init.trunc_normal_(layer.weight, std=0.02)
-                        torch.nn.init.zeros_(layer.bias)
-        
+        # nn.Embedding 用于每个chunk中所有view的单独编码
+        self.chunk_view_embedding = nn.Embedding(100, self.info_sharing.dim+self.encoder.enc_embed_dim)
+        self.fusion_scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim+self.info_sharing.dim))
+        torch.nn.init.trunc_normal_(self.fusion_scale_token, std=0.02)
+
 
     def _initialize_inter_chunk_fusion(self, inter_chunk_config):
         """
@@ -319,7 +306,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             self.inter_chunk_pose_head = PoseHead(**inter_chunk_pose_config)
 
             # 检查是否使用恒等变换初始化
-            identity_init = inter_chunk_config.get("pose_head_identity_init", True)
+            identity_init = inter_chunk_config.get("pose_head_identity_init", False)
 
             if identity_init:
                 # 恒等变换初始化：输出层初始化为恒等变换，中间层小权重
@@ -760,6 +747,61 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                         if ckpt_key.startswith(submodule):
                             filtered_ckpt[ckpt_key] = ckpt_value
                 print(self.load_state_dict(filtered_ckpt, strict=False))
+
+    def _copy_specific_weights(self):
+        """
+        Custom weight copying function:
+        1. Copies the last layer of info_sharing.self_attention_blocks to all layers
+           of inter_chunk_fusion.self_attention_blocks.
+        2. Copies the info_sharing.norm layer to inter_chunk_fusion.norm layer.
+        3. Copies the entire pose_head weights to inter_chunk_pose_head.
+        """
+        with torch.no_grad():
+            print("Starting specific weight copying for inter-chunk components (including norm layers)...")
+
+            # --- 1. 拷贝信息共享 Attention Blocks 的权重 ---
+            try:
+                info_sharing_blocks = self.info_sharing.self_attention_blocks
+                last_layer_index = len(info_sharing_blocks) - 1
+                source_block = info_sharing_blocks[last_layer_index]
+                source_state_dict = source_block.state_dict()
+                
+                inter_chunk_blocks = self.inter_chunk_fusion.self_attention_blocks
+                num_inter_chunk_layers = len(inter_chunk_blocks)
+                
+                for i in range(num_inter_chunk_layers):
+                    target_block = inter_chunk_blocks[i]
+                    target_block.load_state_dict(source_state_dict, strict=True)
+                
+                print(f"✅ Copied info_sharing layer {last_layer_index} to all {num_inter_chunk_layers} inter_chunk_fusion layers.")
+
+            except Exception as e:
+                print(f"⚠️ Warning: Could not perform info_sharing block copy. Error: {e}")
+            
+            # --- 2. 拷贝最终归一化层 (self.norm) 的权重 ---
+            try:
+                source_norm_state = self.info_sharing.norm.state_dict()
+                self.inter_chunk_fusion.norm.load_state_dict(source_norm_state, strict=True)
+                
+                print("✅ Copied info_sharing.norm weights to inter_chunk_fusion.norm.")
+            
+            except Exception as e:
+                print(f"⚠️ Warning: Could not perform final norm layer copy. Error: {e}")
+
+            # --- 3. 拷贝姿态头模块的权重 ---
+            try:
+                if not hasattr(self, 'pose_head') or not hasattr(self, 'inter_chunk_pose_head'):
+                    raise AttributeError("Pose heads not initialized.")
+
+                pose_head_state = self.pose_head.state_dict()
+                self.inter_chunk_pose_head.load_state_dict(pose_head_state, strict=True)
+                
+                print("✅ Copied pose_head weights to inter_chunk_pose_head.")
+
+            except Exception as e:
+                print(f"⚠️ Warning: Could not perform pose_head to inter_chunk_pose_head weight copy. Error: {e}")
+                
+            print("Specific weight copying complete.")
 
     def _encode_n_views(self, views):
         """
@@ -1421,6 +1463,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
             # Get the predicted chunk2world pose
             chunk_trans, chunk_quats = (chunk_ref_pose.value.split([3, 4], dim=-1))
+            chunk_quats = chunk_quats / torch.norm(chunk_quats, dim=-1, keepdim=True)
 
             if DEBUG:
                 # use identity transform for debugging
@@ -1820,26 +1863,9 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
-    def _chunk_id_positional_encoding(self, chunk_id, batch_size_per_view):
-        """
-        Generate positional encoding based on chunk ID.
-
-        Args:
-            chunk_id (int): The chunk ID to generate encoding for.
-            batch_size_per_view (int): Batch size per view.
-
-        Returns:
-            torch.Tensor: Positional encoding of shape (batch_size_per_view, C, 1)
-        """
-        chunk_id_tensor = torch.tensor([chunk_id], device=self.device, dtype=torch.long)
-        encoding = self.chunk_id_embedding(chunk_id_tensor)  # (1, C)
-        # Expand to batch size and add singleton dimension
-        encoding = encoding.expand(batch_size_per_view, -1).unsqueeze(-1)  # (B, C, 1)
-        return encoding
-
     def _chunk_attn_pooling(self, chunk_features):
         """chunk_features: Tensor of shape (B, C, V, H, W)
-
+        
         Returns:
             pooled_features: Tensor of shape (B, C, 1)
         """
@@ -1857,7 +1883,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         pooled_features = einsum(chunk_features_attn, chunk_features_reshaped, "b n m, b m c -> b n c")  # (B, V*H*W, C)
         # 4. average pool over the sequence dimension to get (B, 1, C)
         pooled_features = pooled_features.mean(dim=1,keepdim=True)
-        # 5. use self.semantic_proj
+        # 5. use self.semantic_proj 
         pooled_features = self.semantic_proj(pooled_features) # (B, 1, C)
         # 6. reshape to (B, C, 1)
         pooled_features = rearrange(
@@ -1921,9 +1947,9 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             #     else:
             #         num_chunks = 1
 
-            num_chunks = num_views
+            # num_chunks = num_views
 
-            # num_chunks = 2
+            num_chunks = 2
 
             # 验证输入约束
             assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
@@ -1933,9 +1959,6 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             all_chunk_final_features = []  # 收集所有chunk的完整final features结构体
             all_chunk_intermediate_features = []  # 收集每个chunk的intermediate features
             all_chunk_encoder_features_across_views = []
-
-            # 生成随机的chunk id排列（保证每个chunk有唯一的不重复id）
-            chunk_id_permutation = torch.randperm(num_chunks)
 
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * chunk_size
@@ -1974,64 +1997,60 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 all_chunk_intermediate_features.append(chunk_intermediate_features)
         
 
+        # # Step 2: Inter-chunk fusion - 把所有views的features当作输入
+        # # 从all_chunk_final_features中提取所有views的features用于fusion
+        # all_view_features_for_fusion = []
+        # for chunk_final_features,chunk_encoder_features in zip(all_chunk_final_features, all_chunk_encoder_features_across_views):
+        #     chunk_final_features_stacked = torch.stack(chunk_final_features.features, dim=2)  # (B, C, V, H, W)
+        #     chunk_encoder_features_stacked = torch.stack(chunk_encoder_features, dim=2)  # (B, C, V, H, W)
+        #     # chunk_semantic_bias = self._chunk_attn_pooling(chunk_final_features_stacked).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1, 1)
+        #     # # 把chunk_semantic_bias加到每个view的feature上
+        #     # chunk_final_features_stacked = chunk_final_features_stacked + chunk_semantic_bias
+        #     # chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_stacked, 'b c v h w -> b c (v h) w')
+        #     # chunk_encoder_features_flatten_to_H_dim = rearrange(chunk_encoder_features_stacked, 'b c v h w -> b c (v h) w')
+        #     # # concat at channel dim
+        #     # chunk_final_features_flatten_to_H_dim = torch.cat([chunk_final_features_flatten_to_H_dim, chunk_encoder_features_flatten_to_H_dim], dim=1)  # (B, 768 + 1024, V*H, W)
+
+        #     chunk_final_features_concat = torch.cat([chunk_final_features_stacked, chunk_encoder_features_stacked], dim=1)  # (B, 768 + 1024, V, H, W)
+        #     chunk_first_view_embedding_rearranged = rearrange(self.chunk_first_view_embedding, 'c -> 1 c 1 1 1')  # (1, C, 1, 1, 1)
+        #     chunk_first_view_embedding_rearranged = torch.cat([chunk_first_view_embedding_rearranged] + \
+        #                             (len(chunk_final_features.features)-1)*[torch.zeros_like(chunk_first_view_embedding_rearranged)], dim=2)  # (1, C, V, 1, 1)
+        #     chunk_final_features_flatten_to_H_dim = chunk_final_features_concat + chunk_first_view_embedding_rearranged  # (B, C, V, H, W)
+        #     chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_flatten_to_H_dim, 'b c v h w -> b c (v h) w')
+
+        #     all_view_features_for_fusion.append(chunk_final_features_flatten_to_H_dim)
+
         # Step 2: Inter-chunk fusion - 把所有views的features当作输入
-        # 从all_chunk_final_features中提取所有views的features用于fusion
         all_view_features_for_fusion = []
-        for chunk_idx, (chunk_final_features,chunk_encoder_features) in enumerate(zip(all_chunk_final_features, all_chunk_encoder_features_across_views)):
-            chunk_final_features_stacked = torch.stack(chunk_final_features.features, dim=2)  # (B, C, V, H, W)
+        for chunk_final_features, chunk_intermediate_features in zip(all_chunk_final_features, all_chunk_intermediate_features):
+            chunk_intermediate_features_stacked = torch.stack(chunk_intermediate_features[1].features, dim=2)  # (B, C, V, H, W)
             chunk_encoder_features_stacked = torch.stack(chunk_encoder_features, dim=2)  # (B, C, V, H, W)
-            chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_stacked, 'b c v h w -> b c (v h) w')
-            chunk_encoder_features_flatten_to_H_dim = rearrange(chunk_encoder_features_stacked, 'b c v h w -> b c (v h) w')
 
-            if hasattr(self, 'view_pose_encoder'):
-                # 提取当前chunk中每个view的pose信息并编码
-                start_idx = chunk_idx * chunk_size
-                end_idx = (chunk_idx + 1) * chunk_size
-                chunk_views = views[start_idx:end_idx]
-                batch_size_per_view = chunk_views[0]["img"].shape[0]
+            chunk_final_features_concat = torch.cat([chunk_intermediate_features_stacked, chunk_encoder_features_stacked], dim=1)  # (B, 768 + 1024, V, H, W)
+            # chunk_first_view_embedding_rearranged = rearrange(self.chunk_first_view_embedding, 'c -> 1 c 1 1 1')  # (1, C, 1, 1, 1)
+            # chunk_first_view_embedding_rearranged = torch.cat([chunk_first_view_embedding_rearranged] + \
+            #                         (len(chunk_final_features.features)-1)*[torch.zeros_like(chunk_first_view_embedding_rearranged)], dim=2)  # (1, C, V, 1, 1)
+    
+            # self.chunk_view_embedding是一个nn.embedding，直接根据view index取对应的embedding
+            chunk_view_embedding = self.chunk_view_embedding(
+                torch.arange(len(chunk_final_features.features), device=chunk_final_features.features[0].device)
+            )  # (V, C)
+            chunk_view_embedding_rearranged = rearrange(chunk_view_embedding, 'v c -> 1 c v 1 1')  # (1, C, V, 1, 1)
+            chunk_final_features_flatten_to_H_dim = chunk_final_features_concat + chunk_view_embedding_rearranged  # (B, C, V, H, W)
+            chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_flatten_to_H_dim, 'b c v h w -> b c (v h) w')
 
-                # 提取pose信息
-                pose_quats_list = []
-                pose_trans_list = []
-                for view in chunk_views:
-                    if "camera_pose_quats" in view and "camera_pose_trans" in view:
-                        pose_quats_list.append(view["camera_pose_quats"])
-                        pose_trans_list.append(view["camera_pose_trans"])
-                    else:
-                        # 如果没有pose信息，使用identity
-                        identity_quats = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device).expand(batch_size_per_view, -1)
-                        identity_trans = torch.zeros(batch_size_per_view, 3, device=self.device)
-                        pose_quats_list.append(identity_quats)
-                        pose_trans_list.append(identity_trans)
-
-                # 堆叠pose信息 (B*V, 4) 和 (B*V, 3)
-                pose_quats = torch.cat(pose_quats_list, dim=0)
-                pose_trans = torch.cat(pose_trans_list, dim=0)
-
-                # 用view_pose_encoder编码pose
-                pose_input = torch.cat([pose_quats, pose_trans], dim=-1).unsqueeze(-1)  # (B*V, 7, 1)
-                pose_encoding = self.view_pose_encoder(PredictionHeadTokenInput(pose_input)).decoded_channels.squeeze(-1)  # (B*V, embed_dim)
-
-                # reshape成 (B, V, embed_dim)
-                pose_encoding = pose_encoding.view(batch_size_per_view, len(chunk_views), -1)
-
-                # 转置成 (B, embed_dim, V) 并扩展到 (B, embed_dim, V*H, W)
-                pose_encoding = pose_encoding.permute(0, 2, 1)  # (B, embed_dim, V)
-                pose_encoding_expanded = repeat(pose_encoding, 'b c v -> b c v h w', 
-                            h=chunk_final_features_stacked.shape[3], w=chunk_final_features_stacked.shape[4])  # (B, embed_dim, V, H, W)
-                pose_encoding_expanded = rearrange(pose_encoding_expanded, 'b c v h w -> b c (v h) w')  # (B, embed_dim, V*H, W)
-            else:
-                # 什么都不加
-                pose_encoding_expanded = 0
-
-            # 直接相加到chunk_final_features_flatten_to_H_dim
-            chunk_final_features_flatten_to_H_dim = torch.cat([chunk_final_features_flatten_to_H_dim, chunk_encoder_features_flatten_to_H_dim], dim=1)  # (B, C+C_enc, V*H, W)
-            chunk_final_features_flatten_to_H_dim = chunk_final_features_flatten_to_H_dim + pose_encoding_expanded
             all_view_features_for_fusion.append(chunk_final_features_flatten_to_H_dim)
+
+        # Per-chunk info sharing
+        input_scale_token = (
+            self.fusion_scale_token.unsqueeze(0)
+            .unsqueeze(-1)
+            .repeat(batch_size_per_view, 1, 1)
+        )  # (B, C, 1)
 
         inter_fusion_input = MultiViewTransformerInput(
             features=all_view_features_for_fusion,  # n个views的features
-            additional_input_tokens=None  # 不加scale token
+            additional_input_tokens=input_scale_token  
         )
 
         if self.inter_chunk_fusion_return_type == "no_intermediate_features":

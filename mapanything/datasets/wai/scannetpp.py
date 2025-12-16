@@ -156,12 +156,12 @@ def get_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-rd", "--root_dir", default="/fsx/xrtech/data/scannetppv2", type=str
+        "-rd", "--root_dir", default="/wekafs/ict/junyiouy/map_anything_data/scannetppv2", type=str
     )
     parser.add_argument(
         "-dmd",
         "--dataset_metadata_dir",
-        default="/fsx/nkeetha/mapanything_dataset_metadata",
+        default="/wekafs/ict/junyiouy/map-anything/map_anything_dataset/map-anything/mapanything_dataset_metadata",
         type=str,
     )
     parser.add_argument(
@@ -305,3 +305,4 @@ if __name__ == "__main__":
                         colors=filtered_pts_col.reshape(-1, 3),
                     ),
                 )
+# python3 /wekafs/ict/junyiouy/map-anything/mapanything/datasets/wai/scannetpp.py --viz --save Scannetpp_log.rrd --connect False --num_of_views 
