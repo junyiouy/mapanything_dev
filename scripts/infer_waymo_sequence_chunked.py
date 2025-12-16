@@ -17,10 +17,11 @@ import numpy as np
 import torch
 import trimesh
 from PIL import Image
+import rerun as rr
 
 from mapanything.models import MapAnything
 from mapanything.utils.image import preprocess_inputs
-from mapanything.utils.viz import predictions_to_glb
+from mapanything.utils.viz import predictions_to_glb, script_add_rerun_args
 
 from time import time
 
@@ -202,7 +203,7 @@ def create_overlapping_chunks(all_timestamps, chunk_size, overlap_size):
     return chunks
 
 
-def run_inference_on_chunk(model, views, memory_efficient=False):
+def run_inference_on_chunk(model, views, memory_efficient=False,confidence_percentile=0.0):
     """
     Run MapAnything inference on a chunk of views.
 
@@ -231,7 +232,7 @@ def run_inference_on_chunk(model, views, memory_efficient=False):
         amp_dtype="bf16",
         apply_mask=True,
         mask_edges=True,
-        confidence_percentile=20,
+        confidence_percentile=confidence_percentile,
     )
     t1 = time()
     print(f"Inference time: {t1 - t0:.2f} seconds for {len(views)} views")
@@ -411,8 +412,165 @@ def align_point_clouds_to_reference(predictions_list, chunks, reader, camera_typ
     return aligned_predictions
 
 
-def save_chunk_visualizations(predictions_list, output_dir, sequence_name, chunks,
-                           depth_validity_check=True, conf_threshold=0.0, max_points=-1):
+def voxelize_points_and_get_indices(points: np.ndarray, grid_size: tuple[int, int, int]) -> np.ndarray:
+    """
+    将点云体素化（划分到 3D BBox 网格）并返回每个点的 BBox 索引。
+    
+    Args:
+        points: (N, 3) float array of points.
+        grid_size: (Gx, Gy, Gz) tuple defining the grid dimensions.
+        
+    Returns:
+        (N,) int array of voxel indices.
+    """
+    if points.size == 0:
+        return np.array([], dtype=int)
+        
+    # 1. 计算点云的边界
+    min_coords = np.min(points, axis=0)
+    max_coords = np.max(points, axis=0)
+    span = max_coords - min_coords
+    
+    # 避免除以零，对 span=0 的维度进行处理
+    span[span == 0] = 1.0 
+    
+    # 2. 归一化到 [0, 1) 范围
+    # 增加一个小 epsilon 避免归一化后结果为 1.0 导致索引越界
+    epsilon = 1e-6 
+    normalized_points = (points - min_coords) / span
+    normalized_points = np.clip(normalized_points, 0.0, 1.0 - epsilon)
+    
+    # 3. 映射到 BBox 索引 [0, G-1]
+    bbox_indices_3d = np.floor(normalized_points * np.array(grid_size)).astype(int)
+    
+    # 4. 转换为单个 BBox 索引 (index = x + Gx*y + Gx*Gy*z)
+    Gx, Gy, Gz = grid_size
+    bbox_indices_1d = (
+        bbox_indices_3d[:, 0] + 
+        Gx * bbox_indices_3d[:, 1] + 
+        Gx * Gy * bbox_indices_3d[:, 2]
+    )
+    
+    return bbox_indices_1d
+
+
+def log_view_to_rerun(pred, view_idx, chunk_idx, timestamp, camera_name):
+    """
+    Log individual view data to Rerun for visualization, following ScanNet++ pattern.
+
+    Args:
+        pred: Prediction dictionary for this view
+        view_idx: Index of this view within the chunk
+        chunk_idx: Index of this chunk
+        timestamp: Timestamp of this view
+        camera_name: Camera name (e.g., 'FRONT')
+    """
+    if 'pts3d' not in pred or 'camera_poses' not in pred:
+        return
+
+    # Set time sequence for this view
+    rr.set_time("stable_time", sequence=view_idx)
+
+    # Get points and colors
+    pts3d = pred['pts3d'].cpu().numpy().squeeze(0)  # (H, W, 3)
+    mask = pred['mask'].squeeze(-1).cpu().numpy().squeeze(0)  # (H, W)
+    valid_mask = mask > 0.5
+
+    if not np.any(valid_mask):
+        return
+
+    valid_points = pts3d[valid_mask]
+
+    # Get colors
+    img_no_norm = pred['img_no_norm'].cpu().numpy().squeeze(0)  # (H, W, 3)
+    valid_colors = img_no_norm[valid_mask]  # (N, 3)
+    valid_colors = (valid_colors * 255).astype(np.uint8)
+
+    # Get camera pose
+    camera_pose = pred['camera_poses'][0].cpu().numpy()  # 4x4 matrix
+
+    # Create entity path for this view
+    entity_path = f"chunk_{chunk_idx+1:02d}/view_{camera_name}_{timestamp}"
+
+    # Log point cloud for this view
+    rr.log(
+        f"{entity_path}/pointcloud",
+        rr.Points3D(
+            valid_points,
+            colors=valid_colors,
+            radii=0.05,  # Smaller radius for individual views
+        ),
+    )
+
+    # Log camera transform
+    rr.log(
+        f"{entity_path}/camera/pinhole",
+        rr.Transform3D(
+            translation=camera_pose[:3, 3],
+            mat3x3=camera_pose[:3, :3],
+        ),
+    )
+
+    # Log camera pinhole and frustum if intrinsics are available
+    if 'intrinsics' in pred:
+        intrinsics = pred['intrinsics'].squeeze(0).detach().cpu().numpy()  # 3x3 matrix
+        H, W = pts3d.shape[0], pts3d.shape[1]  # Use depth map dimensions
+
+        # Log pinhole camera for image plane visualization
+        rr.log(
+            f"{entity_path}/camera/pinhole",
+            rr.Pinhole(
+                image_from_camera=intrinsics,
+                height=H,
+                width=W,
+                camera_xyz=rr.ViewCoordinates.RDF,
+                image_plane_distance=1.
+            ),
+        )
+
+        # Log RGB image if available
+        if 'img_no_norm' in pred:
+            rr.log(
+                f"{entity_path}/camera/pinhole",
+                rr.Image(pred['img_no_norm']),
+            )
+
+    print(f"Logged view {camera_name}_{timestamp} with {len(valid_points)} points")
+
+
+def log_chunk_to_rerun(combined_points, combined_colors, chunk_idx, max_points=-1):
+    """
+    Log final (sampled) chunk data to Rerun for visualization.
+
+    Args:
+        combined_points: (N, 3) numpy array of points (already sampled/aligned).
+        combined_colors: (N, 3) numpy array of colors (already sampled/aligned).
+        chunk_idx: Index of this chunk.
+        max_points: Max points to log (applied only if combined_points is too large).
+    """
+    print(f"Logging chunk {chunk_idx + 1} to Rerun...")
+
+    # Set time sequence for this chunk
+    rr.set_time("chunk", sequence=chunk_idx)
+
+    points_to_log = combined_points
+    colors_to_log = combined_colors
+
+    # Log point cloud to Rerun
+    rr.log(
+        f"chunk_{chunk_idx+1:02d}/pointcloud",
+        rr.Points3D(
+            points_to_log,
+            colors=colors_to_log,
+            radii=0.01,  # Small radius for visibility
+        ),
+    )
+
+    print(f"Logged {len(points_to_log)} points for chunk {chunk_idx + 1} (after Rerun-specific sampling).")
+
+
+def save_chunk_visualizations(predictions_list, output_dir, sequence_name, chunks, camera_types,
+                           depth_validity_check=True, conf_threshold=0.0, max_points=-1, bbox_grid_size=None, viz_rerun=False):
     """
     Save visualization results for each chunk separately.
 
@@ -421,9 +579,12 @@ def save_chunk_visualizations(predictions_list, output_dir, sequence_name, chunk
         output_dir: Output directory path
         sequence_name: Name of the sequence for file naming
         chunks: List of chunk timestamp lists
+        camera_types: List of camera types used
         depth_validity_check: Whether to check depth validity (> 0)
         conf_threshold: Confidence threshold for filtering (0.0 = no filtering)
-        max_points: Maximum number of points to keep (-1 = no limit)
+        max_points: Maximum number of points to keep (-1 = no limit). *Retained for Rerun logging limit.*
+        bbox_grid_size: Tuple (Gx, Gy, Gz) for density-based sampling. None to disable.
+        viz_rerun: Whether to log data to Rerun
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -434,7 +595,10 @@ def save_chunk_visualizations(predictions_list, output_dir, sequence_name, chunk
         all_points = []
         all_colors = []
 
-        for pred in predictions:
+        for pred_idx, pred in enumerate(predictions):
+            if 'pts3d' not in pred:
+                continue
+                
             # Get world points (already aligned)
             pts3d = pred['pts3d'].cpu().numpy()  # (H, W, 3)
             mask = pred['mask'].squeeze(-1).cpu().numpy()  # (H, W)
@@ -448,15 +612,7 @@ def save_chunk_visualizations(predictions_list, output_dir, sequence_name, chunk
                 depth_valid = depth_z > 0
                 valid_mask = valid_mask & depth_valid
 
-            # Confidence threshold
-            if conf_threshold > 0.0 and 'conf' in pred:
-                conf = pred['conf'].cpu().numpy()
-                conf_valid = conf >= conf_threshold
-                valid_mask = valid_mask & conf_valid
-
-            # Point limit (random sampling)
-            if max_points > 0 and np.sum(valid_mask) > max_points:
-                valid_mask = randomly_limit_trues(valid_mask, max_points)
+            # --- NOTE: Simple max_points sampling is NOT applied here, only filters are applied ---
 
             # Get valid points and colors
             valid_points = pts3d[valid_mask]
@@ -469,10 +625,87 @@ def save_chunk_visualizations(predictions_list, output_dir, sequence_name, chunk
             all_points.append(valid_points)
             all_colors.append(valid_colors)
 
+            # Log individual view to Rerun (Only if Rerun is enabled)
+            if viz_rerun:
+                # Determine camera name and timestamp for this prediction
+                timestamp_idx = pred_idx // len(camera_types)
+                camera_idx = pred_idx % len(camera_types)
+
+                if timestamp_idx < len(chunk_timestamps) and camera_idx < len(camera_types):
+                    timestamp = chunk_timestamps[timestamp_idx]
+                    camera_name = camera_types[camera_idx]
+
+                    log_view_to_rerun(pred, pred_idx, chunk_idx, timestamp, camera_name)
+
+
         # Combine all points and colors for this chunk
         if all_points:
             combined_points = np.concatenate(all_points, axis=0)
             combined_colors = np.concatenate(all_colors, axis=0)
+            
+            # --- START: Density-Based Sampling Logic (Applied to file save and Rerun) ---
+            if bbox_grid_size is not None and len(combined_points) > 0:
+                print(f"Applying density-based sampling with grid size: {bbox_grid_size}...")
+
+                # 1. Voxelization
+                bbox_indices_1d = voxelize_points_and_get_indices(combined_points, bbox_grid_size)
+
+                # 2. Count points per occupied bbox (exclude empty bboxes)
+                unique_indices, counts = np.unique(bbox_indices_1d, return_counts=True)
+
+                # Only consider bboxes that have points
+                occupied_counts = counts[counts > 0]  # Exclude empty bboxes
+
+                # if occupied_counts.size > 0:
+                #     median_count = int(np.median(occupied_counts))
+                # else:
+                #     median_count = 0
+
+                # median_count = 200000//max(bbox_grid_size)
+                median_count = 200000000  # 保留所有点
+
+                if median_count > 0:
+                    print(f"  Total initial points: {len(combined_points)}")
+                    print(f"  Number of occupied BBoxes: {len(unique_indices)}")
+                    print(f"  Median point count among occupied BBoxes (Threshold M): {median_count}")
+
+                    # 3. Conditional Downsampling Preparation
+                    bbox_to_original_indices = defaultdict(list)
+                    for original_idx, bbox_idx in enumerate(bbox_indices_1d):
+                        bbox_to_original_indices[bbox_idx].append(original_idx)
+
+                    final_retained_indices_list = []
+
+                    # 4. Conditional Downsampling - only for occupied bboxes
+                    for bbox_idx, count in zip(unique_indices, counts):
+                        original_indices = bbox_to_original_indices[bbox_idx]
+                        N_i = len(original_indices)  # 当前 BBox 的点数
+
+                        if N_i <= median_count:
+                            # 点数不足或等于中位数：保留所有点
+                            retained_indices = original_indices
+                        else:
+                            # 点数过多：随机下采样到中位数 M
+                            target_count = median_count
+
+                            # 随机选择 target_count 个点的原始索引
+                            retained_indices = np.random.choice(
+                                original_indices,
+                                size=target_count,
+                                replace=False
+                            ).tolist()
+
+                        final_retained_indices_list.extend(retained_indices)
+
+                    final_retained_indices = np.array(final_retained_indices_list)
+
+                    # 5. 生成最终的、下采样后的点云
+                    combined_points = combined_points[final_retained_indices]
+                    combined_colors = combined_colors[final_retained_indices]
+                    print(f"  Points after density-based sampling: {len(combined_points)}")
+                else:
+                    print("  No occupied bboxes found, no density sampling applied.")
+            # --- END: Density-Based Sampling Logic ---
 
             # Save PLY point cloud
             ply_path = os.path.join(output_dir, f"{sequence_name}_chunk{chunk_idx+1:02d}_pointcloud.ply")
@@ -482,6 +715,11 @@ def save_chunk_visualizations(predictions_list, output_dir, sequence_name, chunk
             point_cloud.export(ply_path)
 
             print(f"Saved {len(combined_points)} points for chunk {chunk_idx + 1}")
+            
+            # # --- RERUN LOGGING (使用经过密度采样的点云) ---
+            # if viz_rerun:
+            #      log_chunk_to_rerun(combined_points, combined_colors, chunk_idx, max_points)
+
         else:
             print(f"No valid points found for chunk {chunk_idx + 1}!")
 
@@ -490,6 +728,8 @@ def randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
     """
     If mask has more than max_trues True values,
     randomly keep only max_trues of them and set the rest to False.
+    
+    NOTE: This function is deprecated for file saving but retained for Rerun visualization.
     """
     # 1D positions of all True entries
     true_indices = np.flatnonzero(mask)  # shape = (N_true,)
@@ -531,6 +771,7 @@ def validate_modalities(modalities):
 
 def main():
     parser = argparse.ArgumentParser(description="Run MapAnything on Waymo sequences with chunking and alignment")
+    script_add_rerun_args(parser)
     parser.add_argument(
         "--sequence_dir",
         type=str,
@@ -603,16 +844,53 @@ def main():
         "--max_points",
         type=int,
         default=-1,
-        help="Maximum number of points to keep (-1 for no limit, default: -1)"
+        help="Maximum number of points to keep (-1 for no limit, default: -1). Primarily used to limit Rerun visualization size."
+    )
+    parser.add_argument(
+        "--bbox_grid_size",
+        type=int,
+        nargs=3,
+        default=None,
+        help="3D grid size (Gx Gy Gz) for density-based sampling. If provided (e.g., 10 10 10), it applies point density control before saving."
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=-1,
+        help="Maximum number of frames to process (-1 for all frames, default: -1)"
+    )
+    parser.add_argument(
+        "--downsample_rate",
+        type=int,
+        default=1,
+        help="Downsample rate for frames (default: 1, no downsampling)"
     )
 
     args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Initialize Rerun if visualization is enabled
+    if args.connect or args.save or args.stdout:
+        rr.init(f"MapAnything_Waymo_{os.path.basename(args.sequence_dir)}")
+        if args.connect:
+            rr.spawn()
+        if args.save:
+            rr.save(args.save)
+        if args.stdout:
+            # For stdout, Rerun doesn't have direct support in current version
+            # You might need to implement custom logging or use save to temp file
+            pass
 
     # Validate modalities
     validate_modalities(args.modalities)
     print(f"Using modalities: {args.modalities}")
     print(f"Metric scale: {not args.no_metric_scale}")
     print(f"Chunk size: {args.chunk_size}, Overlap size: {args.overlap_size}")
+    if args.bbox_grid_size:
+        print(f"Density Sampling Grid: {args.bbox_grid_size}")
+    else:
+        print("Density Sampling: Disabled")
 
     # Set up device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -630,6 +908,16 @@ def main():
 
     # Get all timestamps
     all_frames = reader.get_frames()
+
+    # downsample_rate
+    if args.downsample_rate > 1:
+        all_frames = all_frames[::args.downsample_rate]
+        print(f"Downsampled frames by rate {args.downsample_rate}, total frames: {len(all_frames)}")
+
+    # Get only the first args.max_frames frames if specified
+    if args.max_frames > 0:
+        all_frames = all_frames[:args.max_frames]
+
     all_timestamps = sorted(list(set(frame['timestamp'] for frame in all_frames)))
     print(f"Total timestamps in sequence: {len(all_timestamps)}")
 
@@ -669,7 +957,7 @@ def main():
             view['data_norm_type'] = [data_norm_type]
 
         # Run inference on this chunk
-        predictions = run_inference_on_chunk(model, views, not args.no_memory_efficient)
+        predictions = run_inference_on_chunk(model, views, not args.no_memory_efficient, confidence_percentile=args.conf_threshold)
         predictions_list.append(predictions)
 
     print(f"\nCompleted inference on {len(chunks)} chunks")
@@ -681,15 +969,84 @@ def main():
     )
 
     # Save visualizations for each chunk separately
+    bbox_size = tuple(args.bbox_grid_size) if args.bbox_grid_size else None
     save_chunk_visualizations(
-        aligned_predictions, args.output_dir, sequence_name, chunks,
-        not args.no_depth_validity_check, args.conf_threshold, args.max_points
-    )
+        aligned_predictions, args.output_dir, sequence_name, chunks, args.camera_types,
+        not args.no_depth_validity_check, args.conf_threshold, args.max_points,
+        bbox_grid_size=bbox_size,
+        viz_rerun=args.connect or args.save or args.stdout
+    ) 
 
     print("\nProcessing completed!")
 
 
 if __name__ == "__main__":
     main()
-# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py --sequence_dir /wekafs/ict/junyiouy/waymo_preprocessing/waymo_ns/1172406780360799916_1660_000_1680_000    \
-# --camera_types FRONT --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/single_view/waymo_output_image_no_metric_chunk_60      --no_metric_scale --max_points 30000      --modalities image  --chunk_size 60 --conf_threshold 0.2  --overlap_size 1
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py --sequence_dir /wekafs/ict/junyiouy/waymo_preprocessing/waymo_ns/1172406780360799916_1660_000_1680_000   --camera_types FRONT --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/single_view/waymo_output_image_no_metric_chunk_60      --no_metric_scale --max_points 30000      --modalities image  --chunk_size 60 --conf_threshold 0.2  --overlap_size 1
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/3341890853207909601_1020_000_1040_000   --camera_types FRONT --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object      --no_metric_scale --max_points 30000      --modalities image  --chunk_size 60 --conf_threshold 0.2  --overlap_size 1
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py \
+#   --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/3341890853207909601_1020_000_1040_000 \
+#   --camera_types FRONT \
+#   --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short \
+#   --no_metric_scale --max_points 30000 --modalities image \
+#   --chunk_size 60 --conf_threshold 0.2 --overlap_size 1 \
+#   --save /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short/waymo_sequence.rrd \
+#   --max_frames 40
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py \
+#   --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/3341890853207909601_1020_000_1040_000 \
+#   --camera_types FRONT \
+#   --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive \
+#   --no_metric_scale --max_points 30000 --modalities image \
+#   --chunk_size 60 --conf_threshold 0.0 --overlap_size 1 \
+#   --save /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive/waymo_sequence.rrd \
+#   --max_frames 10
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py \
+#   --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/3341890853207909601_1020_000_1040_000 \
+#   --camera_types FRONT \
+#   --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params \
+#   --no_metric_scale --max_points 30000 --modalities image intrinsics poses\
+#   --chunk_size 60 --conf_threshold 0.0 --overlap_size 1 \
+#   --save /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params/waymo_sequence.rrd \
+#   --max_frames 10
+
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py \
+#   --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/3341890853207909601_1020_000_1040_000 \
+#   --camera_types FRONT \
+#   --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale \
+#   --max_points 30000 --modalities image intrinsics poses\
+#   --chunk_size 60 --conf_threshold 0.0 --overlap_size 1 \
+#   --save /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale/waymo_sequence.rrd \
+#   --max_frames 10
+
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py \
+#   --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/5585555620508986875_720_000_740_000 \
+#   --camera_types FRONT \
+#   --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale_1 \
+#   --max_points 30000 --modalities image intrinsics poses\
+#   --chunk_size 60 --conf_threshold 0.0 --overlap_size 1 \
+#   --save /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale_1/waymo_sequence.rrd \
+#   --max_frames 10
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py \
+#   --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/2942662230423855469_880_000_900_000 \
+#   --camera_types FRONT \
+#   --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale_2 \
+#   --max_points 30000 --modalities image intrinsics poses\
+#   --chunk_size 60 --conf_threshold 0.0 --overlap_size 1 \
+#   --save /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale_2/waymo_sequence.rrd \
+#   --max_frames 10
+
+# python /wekafs/ict/junyiouy/map-anything/scripts/infer_waymo_sequence_chunked.py \
+#   --sequence_dir /wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/2942662230423855469_880_000_900_000 \
+#   --camera_types FRONT \
+#   --output_dir /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale_3 \
+#   --max_points 30000 --modalities image intrinsics poses\
+#   --chunk_size 60 --conf_threshold 0.0 --overlap_size 1 \
+#   --save /wekafs/ict/junyiouy/map-anything/waymo_output/dynamic_long_object_short_adaptive_w_params_w_metric_scale_3/waymo_sequence.rrd \
+#   --max_frames 60 --downsample_rate 2
