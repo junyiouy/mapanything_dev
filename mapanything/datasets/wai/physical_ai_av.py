@@ -4,7 +4,7 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 """
-ScanNet++V2 Dataset using WAI format data.
+PhysicalAIAV Dataset using WAI format data.
 """
 
 import os
@@ -15,9 +15,9 @@ from mapanything.datasets.base.base_dataset import BaseDataset
 from mapanything.utils.wai.core import load_data, load_frame
 
 
-class ScanNetPPWAI(BaseDataset):
+class PhysicalAIAVWAI(BaseDataset):
     """
-    ScanNet++V2 dataset containing large diversity of indoor scenes.
+    PhysicalAIAV dataset containing real-world driving scenes.
     """
 
     def __init__(
@@ -52,7 +52,7 @@ class ScanNetPPWAI(BaseDataset):
         self._load_data()
 
         # Define the dataset type flags
-        self.is_metric_scale = True
+        self.is_metric_scale = True  # PhysicalAIAV is real-world metric scale
         self.is_synthetic = False
 
     def _load_data(self):
@@ -61,7 +61,7 @@ class ScanNetPPWAI(BaseDataset):
         split_metadata_path = os.path.join(
             self.dataset_metadata_dir,
             self.split,
-            f"scannetppv2_scene_list_{self.split}.npy",
+            f"physical_ai_av_scene_list_{self.split}.npy",
         )
         split_scene_list = np.load(split_metadata_path, allow_pickle=True)
 
@@ -70,15 +70,28 @@ class ScanNetPPWAI(BaseDataset):
             self.scenes = list(split_scene_list)
         else:
             self.scenes = [self.specific_scene_name]
-        if self.overfit_num_sets is not None:
-            original_len = len(self.scenes)
-            self.scenes = self.scenes[: self.overfit_num_sets]
-            self.scenes = self.scenes * (
-                original_len // self.overfit_num_sets 
-            )
-            print(f"Overfitting to {self.overfit_num_sets} sets. Total scenes used: {len(self.scenes)}")
-
         self.num_of_scenes = len(self.scenes)
+
+    @staticmethod
+    def build_manual_covisibility_matrix(num_views_in_scene):
+        """
+        Manually build covisibility matrix for PhysicalAIAV.
+        Args:
+            num_views_in_scene: Number of views in the scene.
+        Returns:
+            num_views_in_scene x num_views_in_scene covisibility matrix.
+        """
+        pairwise_covisibility = np.zeros((num_views_in_scene, num_views_in_scene), dtype=np.float32)
+
+        for i in range(num_views_in_scene):
+            for j in range(num_views_in_scene):
+                time_diff = abs(i - j)
+                if time_diff <= 10:
+                    pairwise_covisibility[i, j] = 0.0
+                else:
+                    pairwise_covisibility[i, j] = 1.0
+
+        return pairwise_covisibility
 
     def _get_views(self, sampled_idx, num_views_to_sample, resolution):
         # Get the scene name of the sampled index
@@ -91,26 +104,16 @@ class ScanNetPPWAI(BaseDataset):
             os.path.join(scene_root, "scene_meta.json"), "scene_meta"
         )
         scene_file_names = list(scene_meta["frame_names"].keys())
+        scene_file_names.sort()
         num_views_in_scene = len(scene_file_names)
 
-        # Load the scene pairwise covisibility mmap
-        covisibility_version_key = "v0"
-        covisibility_map_dir = os.path.join(
-            scene_root, "covisibility", covisibility_version_key
-        )
-        # Assumes only npy file in directory is covisbility map
-        covisibility_map_name = next(
-            f for f in os.listdir(covisibility_map_dir) if f.endswith(".npy")
-        )
-        covisibility_map_path = os.path.join(
-            scene_root, "covisibility", covisibility_version_key, covisibility_map_name
-        )
-        pairwise_covisibility = load_data(covisibility_map_path, "mmap")
-
-        # Get the indices of the N views in the scene
+        # Build covisibility matrix and sample views
+        pairwise_covisibility = self.build_manual_covisibility_matrix(num_views_in_scene)
         view_indices = self._sample_view_indices(
             num_views_to_sample, num_views_in_scene, pairwise_covisibility
         )
+        # sort the view indices for consistent ordering
+        view_indices = np.sort(view_indices)
 
         # Get the views corresponding to the selected view indices
         views = []
@@ -120,18 +123,18 @@ class ScanNetPPWAI(BaseDataset):
             view_data = load_frame(
                 scene_root,
                 view_file_name,
-                modalities=["image", "rendered_depth"],
+                modalities=["image", "depth"],
                 scene_meta=scene_meta,
             )
 
             # Convert necessary data to numpy
             image = view_data["image"].permute(1, 2, 0).numpy()
             image = (image * 255).astype(np.uint8)
-            depthmap = view_data["rendered_depth"].numpy().astype(np.float32)
+            depthmap = view_data["depth"].numpy().astype(np.float32)
             intrinsics = view_data["intrinsics"].numpy().astype(np.float32)
             c2w_pose = view_data["extrinsics"].numpy().astype(np.float32)
 
-            # Ensure that the depthmap has all valid values
+            # Handle incomplete GT depth map - ensure all values are valid
             depthmap = np.nan_to_num(depthmap, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Resize the data to match the desired resolution
@@ -150,7 +153,7 @@ class ScanNetPPWAI(BaseDataset):
                     depthmap=depthmap,
                     camera_pose=c2w_pose,  # cam2world
                     camera_intrinsics=intrinsics,
-                    dataset="ScanNetPP",
+                    dataset="PhysicalAIAV",
                     label=scene_name,
                     instance=os.path.join("images", str(view_file_name)),
                 )
@@ -164,7 +167,7 @@ def get_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-rd", "--root_dir", default="/wekafs/ict/junyiouy/map_anything_data/scannetppv2", type=str
+        "-rd", "--root_dir", default="/wekafs/ict/junyiouy/map_anything_data/physical_ai_av_train", type=str
     )
     parser.add_argument(
         "-dmd",
@@ -197,47 +200,25 @@ if __name__ == "__main__":
     )  # Options: --headless, --connect, --serve, --addr, --save, --stdout
     args = parser.parse_args()
 
-    dataset = ScanNetPPWAI(
+    dataset = PhysicalAIAVWAI(
         num_views=args.num_of_views,
         split="train",
         covisibility_thres=0.25,
         ROOT=args.root_dir,
         dataset_metadata_dir=args.dataset_metadata_dir,
-        resolution=(518, 336),
+        resolution=(518, 392),
         aug_crop=16,
         transform="colorjitter+grayscale+gaublur",
         data_norm_type="dinov2",
     )
-    # dataset = ScanNetPPWAI(
-    #     num_views=args.num_of_views,
-    #     split="val",
-    #     covisibility_thres=0.25,
-    #     ROOT=args.root_dir,
-    #     dataset_metadata_dir=args.dataset_metadata_dir,
-    #     resolution=(518, 336),
-    #     seed=777,
-    #     transform="imgnorm",
-    #     data_norm_type="dinov2",
-    # )
-    # dataset = ScanNetPPWAI(
-    #     num_views=args.num_of_views,
-    #     split="test",
-    #     covisibility_thres=0.25,
-    #     ROOT=args.root_dir,
-    #     dataset_metadata_dir=args.dataset_metadata_dir,
-    #     resolution=(518, 336),
-    #     seed=777,
-    #     transform="imgnorm",
-    #     data_norm_type="dinov2",
-    # )
     print(dataset.get_stats())
 
     if args.viz:
-        rr.script_setup(args, "ScanNetPP_Dataloader")
+        rr.script_setup(args, "PhysicalAIAV_Dataloader")
         rr.set_time("stable_time", sequence=0)
         rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
-    sampled_indices = np.random.choice(len(dataset), size=10, replace=False)
+    sampled_indices = np.random.choice(len(dataset), size=5, replace=False)
 
     for num, idx in enumerate(tqdm(sampled_indices)):
         views = dataset[idx]
@@ -313,4 +294,4 @@ if __name__ == "__main__":
                         colors=filtered_pts_col.reshape(-1, 3),
                     ),
                 )
-# python3 /wekafs/ict/junyiouy/map-anything/mapanything/datasets/wai/scannetpp.py --viz --save Scannetpp_log.rrd --connect False --num_of_views 
+# python3 mapanything/datasets/wai/physical_ai_av.py --viz --save PhysicalAIAV_log.rrd --connect False --num_of_views 10

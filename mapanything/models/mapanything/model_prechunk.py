@@ -36,8 +36,9 @@ from uniception.models.encoders import (
 from uniception.models.info_sharing.alternating_attention_transformer import (
     MultiViewAlternatingAttentionTransformer,
     MultiViewAlternatingAttentionTransformerIFR,
+    ChunkedPhaseState
 )
-from uniception.models.info_sharing.base import MultiViewTransformerInput
+from uniception.models.info_sharing.base import MultiViewTransformerInput, MultiViewTransformerOutput
 from uniception.models.info_sharing.cross_attention_transformer import (
     MultiViewCrossAttentionTransformer,
     MultiViewCrossAttentionTransformerIFR,
@@ -85,7 +86,7 @@ if hasattr(torch.backends.cuda, "matmul") and hasattr(
     torch.backends.cuda.matmul.allow_tf32 = True
 
 
-class MapAnything(nn.Module, PyTorchModelHubMixin):
+class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
     "Modular MapAnything model class that supports input of images & optional geometric modalities (multiple reconstruction tasks)."
 
     def __init__(
@@ -1503,13 +1504,13 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
-    def forward(self, views, memory_efficient_inference=False):
+    def forward(self, views, memory_efficient_inference=False, chunk_layer_threshold=10, num_chunks=2):
         """
         Forward pass performing the following operations:
         1. Encodes the N input views (images).
         2. Encodes the optional geometric inputs (ray directions, depths, camera rotations, camera translations).
         3. Fuses the encoded features from the N input views and the optional geometric inputs using addition and normalization.
-        4. Information sharing across the encoded features and a scale token using a multi-view attention transformer.
+        4. Information sharing across the encoded features and a scale token using a multi-view attention transformer with chunked processing.
         5. Passes the final features from transformer through the prediction heads.
         6. Returns the processed final outputs for N views.
 
@@ -1528,50 +1529,134 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                                     "camera_pose_trans" (tensor): Camera pose translations. Tensor of shape (B, 3). Camera pose is opencv (RDF) cam2world transformation.
                                     "is_metric_scale" (tensor): Boolean tensor indicating whether the geometric inputs are in metric scale or not. Tensor of shape (B, 1).
             memory_efficient_inference (bool): Whether to use memory efficient inference or not. This runs the dense prediction head (the memory bottleneck) in a memory efficient manner. Default is False.
+            chunk_layer_threshold (int): Number of transformer layers to process in chunked phase. Default is 6.
+            num_chunks (int): Number of chunks to split the views into. Default is 2.
 
         Returns:
             List[dict]: A list containing the final outputs for all N views.
         """
         # Get input shape of the images, number of views, and batch size per view
+
         batch_size_per_view, _, height, width = views[0]["img"].shape
         img_shape = (int(height), int(width))
         num_views = len(views)
+        num_chunks = num_views
 
-        # Run the image encoder on all the input views
-        all_encoder_features_across_views, all_encoder_registers_across_views = (
-            self._encode_n_views(views)
+        # 验证输入约束
+        assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
+        chunk_size = num_views // num_chunks
+
+        with torch.no_grad():
+            # Step 1: Per-chunk processing - 使用transformer的chunked_phase方法
+            chunked_states = []  # 收集所有chunk的ChunkedPhaseState
+            all_chunk_intermediate_features = []  # 收集每个chunk的intermediate features
+            all_chunk_encoder_features_across_views = []
+
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = (chunk_idx + 1) * chunk_size
+                chunk_views = views[start_idx:end_idx]
+
+                # Per-chunk encode + info sharing
+                chunk_encoder_features, chunk_encoder_registers_across_views = self._encode_n_views(chunk_views)
+
+                with torch.autocast("cuda", enabled=False):
+                    chunk_encoder_features = self._encode_and_fuse_optional_geometric_inputs(
+                        chunk_views, chunk_encoder_features
+                    )
+                all_chunk_encoder_features_across_views.append(chunk_encoder_features)
+
+                # Per-chunk info sharing - 使用chunked_phase
+                input_scale_token = (
+                    self.scale_token.unsqueeze(0)
+                    .unsqueeze(-1)
+                    .repeat(batch_size_per_view, 1, 1)
+                )  # (B, C, 1)
+                info_sharing_input = MultiViewTransformerInput(
+                    features=chunk_encoder_features,
+                    additional_input_tokens_per_view=chunk_encoder_registers_across_views,
+                    additional_input_tokens=input_scale_token,
+                )
+
+                # 使用transformer的chunked_phase方法
+                chunked_state, chunk_intermediate_info_sharing_multi_view_feat = self.info_sharing(
+                    info_sharing_input,
+                    mode="chunked",
+                    chunk_layer_threshold=chunk_layer_threshold,
+                )
+
+                # 收集chunked state
+                chunked_states.append(chunked_state)
+
+                all_chunk_intermediate_features.append(chunk_intermediate_info_sharing_multi_view_feat)
+
+
+        # Step 2: Merge Chunks
+        # additional_token_features: list of (B,C,1)
+        fused_global_tokens = torch.stack(
+            [chunk_state.additional_token_features for chunk_state in chunked_states],
+            dim=0
+        ).mean(dim=0, keepdim=False)  # (B, C, 1)
+        # additional_token_features_per_view: list of list of (B,C,1)
+        # views_features: list of list of (B,C,H,W)
+        fused_global_registers_per_view = None
+        fused_views_features = []
+        for chunk_idx in range(num_chunks):
+            chunk_state = chunked_states[chunk_idx]
+            if fused_global_registers_per_view is None and chunk_state.additional_token_features_per_view is not None:
+                fused_global_registers_per_view = []
+            if fused_global_registers_per_view is not None:
+                fused_global_registers_per_view.extend(
+                    chunk_state.additional_token_features_per_view
+                )  # list of (B,C,1)
+            fused_views_features.extend(
+                chunk_state.view_features
+            )  # list of (B,C,H,W)
+
+        fused_chunk_states = ChunkedPhaseState(
+            view_features=fused_views_features,
+            additional_token_features=fused_global_tokens,
+            additional_token_features_per_view=fused_global_registers_per_view,
+            num_additional_tokens_per_view=chunked_states[0].num_additional_tokens_per_view,
+            num_spatial_tokens_per_view=chunked_states[0].num_spatial_tokens_per_view,
+            batch_size=chunked_states[0].batch_size,
+            height=chunked_states[0].height,
+            width=chunked_states[0].width,
         )
 
-        # Encode the optional geometric inputs and fuse with the encoded features from the N input views
-        # Use high precision to prevent NaN values after layer norm in dense representation encoder (due to high variance in last dim of features)
-        with torch.autocast("cuda", enabled=False):
-            all_encoder_features_across_views = (
-                self._encode_and_fuse_optional_geometric_inputs(
-                    views, all_encoder_features_across_views
+        # Step 3: Merged phase - 将所有chunks合并处理剩余的transformer层
+        final_info_sharing_multi_view_feat, merged_intermediate_multi_view_features = self.info_sharing.forward(
+            fused_chunk_states,
+            mode="merged",
+            chunk_layer_threshold=chunk_layer_threshold,
+        )
+
+        # collect premerge_intermediate_feature
+        premerge_intermediate_feature = []
+        for layer_idx in range(len(all_chunk_intermediate_features[0])):
+            premerge_intermediate_feature_layer = []
+            # 对每个layer，收集所有chunk的features并拼接
+            for chunk_idx in range(num_chunks):
+                premerge_intermediate_feature_layer.extend(
+                    all_chunk_intermediate_features[chunk_idx][layer_idx].features
+                )  # list of MultiViewTransformerOutput
+            premerge_intermediate_feature.append(
+                MultiViewTransformerOutput(
+                    features=premerge_intermediate_feature_layer
                 )
             )
 
-        # Expand the scale token to match the batch size
-        input_scale_token = (
-            self.scale_token.unsqueeze(0)
-            .unsqueeze(-1)
-            .repeat(batch_size_per_view, 1, 1)
-        )  # (B, C, 1)
+        premerge_intermediate_feature.extend(merged_intermediate_multi_view_features)
+        intermediate_info_sharing_multi_view_feat = premerge_intermediate_feature
 
-        # Combine all images into view-centric representation
-        # Output is a list containing the encoded features for all N views after information sharing.
-        info_sharing_input = MultiViewTransformerInput(
-            features=all_encoder_features_across_views,
-            additional_input_tokens_per_view=all_encoder_registers_across_views,
-            additional_input_tokens=input_scale_token,
-        )
-        if self.info_sharing_return_type == "no_intermediate_features":
-            final_info_sharing_multi_view_feat = self.info_sharing(info_sharing_input)
-        elif self.info_sharing_return_type == "intermediate_features":
-            (
-                final_info_sharing_multi_view_feat,
-                intermediate_info_sharing_multi_view_feat,
-            ) = self.info_sharing(info_sharing_input)
+        # 提取最终的features
+        all_encoder_features_across_views = []
+        for chunk_idx in range(num_chunks):
+            all_encoder_features_across_views.extend(
+                all_chunk_encoder_features_across_views[chunk_idx]
+            )
+
+
 
         if self.pred_head_type == "linear":
             # Stack the features for all views

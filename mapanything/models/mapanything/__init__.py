@@ -6,6 +6,7 @@
 from mapanything.models.mapanything.ablations import MapAnythingAblations
 from mapanything.models.mapanything.model import MapAnything
 from mapanything.models.mapanything.model_chunked import MapAnythingChunked
+from mapanything.models.mapanything.model_prechunk import MapAnythingPrechunk
 from mapanything.models.mapanything.modular_dust3r import ModularDUSt3R
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "MapAnythingAblations",
     "ModularDUSt3R",
     "MapAnythingChunked",
+    "MapAnythingPrechunk",
 ]

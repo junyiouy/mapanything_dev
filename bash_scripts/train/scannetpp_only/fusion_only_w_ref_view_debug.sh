@@ -32,4 +32,4 @@ torchrun --nproc_per_node ${NUM_GPUS} --master_port 29504 \
     train_params.eval_freq=2 \
     train_params.max_num_of_imgs_per_gpu=48 \
     train_params.accum_iter=16 \
-    hydra.run.dir='${root_experiments_dir}/mapanything/training/fusion_only_tune_w_ref_view_scannetpp'
+    hydra.run.dir='${root_experiments_dir}/mapanything/training/fusion_only_tune_w_ref_view_scannetpp_debug'

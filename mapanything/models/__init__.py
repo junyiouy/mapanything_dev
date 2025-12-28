@@ -20,8 +20,8 @@ from mapanything.models.mapanything import (
     MapAnythingAblations,
     ModularDUSt3R,
 )
-from mapanything.models.mapanything.model_chunked import MapAnythingChunked as MapAnythingChunked
-
+from mapanything.models.mapanything.model_chunked import MapAnythingChunked 
+from mapanything.models.mapanything.model_prechunk import MapAnythingPrechunk 
 # Suppress DINOv2 warnings
 logging.getLogger("dinov2").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", message="xFormers is available", category=UserWarning)
@@ -68,6 +68,9 @@ MODEL_CONFIGS = {
     },
     "mapanything_chunked": {
         "class": MapAnythingChunked,
+    },
+    "mapanything_prechunk": {
+        "class": MapAnythingPrechunk,
     },
     "mapanything_ablations": {
         "class": MapAnythingAblations,

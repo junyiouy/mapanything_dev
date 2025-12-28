@@ -312,7 +312,11 @@ def prepare_views_from_physical_ai_av_data(
     raw_data_list = []
     for i in tqdm(range(num_scans), desc="Loading raw data"):
         args = (i, lidar_df, camera_reader, egomotion_interp, sensor_extrinsics_df, camera_name)
-        raw_data = load_raw_data_for_scan(args)
+        try:
+            raw_data = load_raw_data_for_scan(args)
+        except Exception as e:
+            print(f"Error loading scan {i}: {e}")
+            continue
         raw_data_list.append(raw_data)
 
 
@@ -684,3 +688,7 @@ if __name__ == "__main__":
 # 95c10498-2dfb-43ff-b469-3671dc5b8b07
 # CUDA_VISIBLE_DEVICES=0 python /wekafs/ict/junyiouy/map-anything/scripts/physicai_chunk_infer/infer_physicai_save_components.py --dataset_path /wekafs/ict/junyiouy/physical_ai_av_dataset --output_dir output_physicai --clip_id $CLIP_ID --point_sampling_rate 0.6 --ref_camera camera_front_wide_120fov --save /wekafs/ict/junyiouy/map-anything/output_physicai/${CLIP_ID}_recon.rrd
 # python /wekafs/ict/junyiouy/map-anything/scripts/physicai_chunk_infer/server_annotator.py --meta_json output_physicai/${CLIP_ID}/scene_meta.json --port 8095 
+
+# export CLIP_ID=95c10498-2dfb-43ff-b469-3671dc5b8b07
+# CUDA_VISIBLE_DEVICES=0 python /wekafs/ict/junyiouy/map-anything/scripts/physicai_chunk_infer/infer_physicai_save_components.py --dataset_path /wekafs/ict/junyiouy/physical_ai_av_dataset --output_dir output_physicai --clip_id $CLIP_ID --point_sampling_rate 0.6  --save /wekafs/ict/junyiouy/map-anything/output_physicai/${CLIP_ID}_recon.rrd --camera_name camera_front_tele_30fov
+

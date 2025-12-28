@@ -77,6 +77,9 @@ from uniception.models.prediction_heads.dpt import DPTFeature, DPTRegressionProc
 from uniception.models.prediction_heads.linear import LinearFeature
 from uniception.models.prediction_heads.mlp_head import MLPHead
 from uniception.models.prediction_heads.pose_head import PoseHead
+from uniception.models.utils.transformer_blocks import Mlp, SwiGLUFFNFused
+
+
 from einops import rearrange, repeat, einsum
 import math
 # Enable TF32 precision if supported (for GPU >= Ampere and PyTorch >= 1.12)
@@ -105,6 +108,8 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         load_specific_pretrained_submodules: bool = False,
         specific_pretrained_submodules: list = None,
         torch_hub_force_reload: bool = False,
+        use_register_tokens_from_encoder: bool = False,
+        info_sharing_mlp_layer_str: str = "mlp",
     ):
         """
         Multi-view model containing an image encoder fused with optional geometric modalities followed by a multi-view attention transformer and respective downstream heads.
@@ -122,6 +127,8 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             load_specific_pretrained_submodules (bool): Whether to load specific pretrained submodules. (default: False)
             specific_pretrained_submodules (list): List of specific pretrained submodules to load. Must be provided when load_specific_pretrained_submodules is True. (default: None)
             torch_hub_force_reload (bool): Whether to force reload the encoder from torch hub. (default: False)
+            use_register_tokens_from_encoder (bool): Whether to use register tokens from encoder. (default: False)
+            info_sharing_mlp_layer_str (str): Type of MLP layer to use in the multi-view transformer. Useful for DINO init of the multi-view transformer. Options: "mlp" or "swiglufused". (default: "mlp")
         """
         super().__init__()
 
@@ -135,6 +142,8 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         self.load_specific_pretrained_submodules = load_specific_pretrained_submodules
         self.specific_pretrained_submodules = specific_pretrained_submodules
         self.torch_hub_force_reload = torch_hub_force_reload
+        self.use_register_tokens_from_encoder = use_register_tokens_from_encoder
+        self.info_sharing_mlp_layer_str = info_sharing_mlp_layer_str
         self.class_init_args = {
             "name": self.name,
             "encoder_config": self.encoder_config,
@@ -145,6 +154,8 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             "load_specific_pretrained_submodules": self.load_specific_pretrained_submodules,
             "specific_pretrained_submodules": self.specific_pretrained_submodules,
             "torch_hub_force_reload": self.torch_hub_force_reload,
+            "use_register_tokens_from_encoder": self.use_register_tokens_from_encoder,
+            "info_sharing_mlp_layer_str": self.info_sharing_mlp_layer_str,
         }
 
         # Get relevant parameters from the configs
@@ -205,6 +216,16 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         self.scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim))
         torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
 
+        # Set the MLP layer config for the info sharing transformer
+        if info_sharing_mlp_layer_str == "mlp":
+            info_sharing_config["module_args"]["mlp_layer"] = Mlp
+        elif info_sharing_mlp_layer_str == "swiglufused":
+            info_sharing_config["module_args"]["mlp_layer"] = SwiGLUFFNFused
+        else:
+            raise ValueError(
+                f"Invalid info_sharing_mlp_layer_str: {info_sharing_mlp_layer_str}. Valid options: ['mlp', 'swiglufused']"
+            )
+
         # Initialize the info sharing module (multi-view transformer)
         self._initialize_info_sharing(info_sharing_config)
 
@@ -240,8 +261,8 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         # torch.nn.init.trunc_normal_(self.fusion_scale_token, std=0.02)
 
         # nn.Embedding 用于每个chunk中所有view的单独编码
-        self.chunk_view_embedding = nn.Embedding(100, self.info_sharing.dim+self.encoder.enc_embed_dim)
-        self.fusion_scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim+self.info_sharing.dim))
+        self.chunk_view_embedding = nn.Embedding(100, self.info_sharing.dim)
+        self.fusion_scale_token = nn.Parameter(torch.zeros(self.info_sharing.dim))
         torch.nn.init.trunc_normal_(self.fusion_scale_token, std=0.02)
 
 
@@ -268,7 +289,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 )
 
         # Add dependencies to inter_chunk_config
-        inter_chunk_config["module_args"]["input_embed_dim"] = self.info_sharing.dim + self.encoder.enc_embed_dim
+        inter_chunk_config["module_args"]["input_embed_dim"] = self.info_sharing.dim
         inter_chunk_config["module_args"]["custom_positional_encoding"] = self.inter_chunk_custom_positional_encoding
         self.inter_chunk_fusion_return_type= inter_chunk_config["model_return_type"]
 
@@ -295,6 +316,12 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             raise ValueError(
                 f"Inter-chunk fusion currently only supports 'no_intermediate_features' return type"
             )
+        
+        # Initialize encoder projection for inter-chunk fusion
+        self.inter_chunk_encoder_proj = nn.Linear(self.encoder.enc_embed_dim, self.info_sharing.dim)
+        # zero initialize
+        torch.nn.init.zeros_(self.inter_chunk_encoder_proj.weight)
+        torch.nn.init.zeros_(self.inter_chunk_encoder_proj.bias)
 
         # Always create inter_chunk_pose_head for chunk pose estimation
         # 创建PoseHead配置，复制现有的pose_head配置
@@ -825,8 +852,16 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         all_encoder_features_across_views = encoder_output.features.chunk(
             num_views, dim=0
         )
+        all_encoder_registers_across_views = None
+        if (
+            self.use_register_tokens_from_encoder
+            and encoder_output.registers is not None
+        ):
+            all_encoder_registers_across_views = encoder_output.registers.chunk(
+                num_views, dim=0
+            )
 
-        return all_encoder_features_across_views
+        return all_encoder_features_across_views, all_encoder_registers_across_views
 
     def _compute_pose_quats_and_trans_for_across_views_in_ref_view(
         self,
@@ -1444,13 +1479,14 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
         return fused_all_encoder_features_across_views
 
-    def _transform_chunk_output_to_world(self, res_list, chunk_ref_poses, img_shape):
+    def _transform_chunk_output_to_world(self, res_list, chunk_ref_poses, chunk_scales, img_shape):
         """
         Transform chunk outputs from chunk coordinate system to unified world coordinate system.
 
         Args:
             res_list: List of lists, each inner list contains prediction dicts for views in a chunk
             chunk_ref_poses: List of predicted poses for each chunk's ref view (chunk2world)
+            chunk_scales: Tensor of shape (B, num_chunks) - scale factors for each chunk
             img_shape: (H, W) image shape
 
         Returns:
@@ -1458,7 +1494,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         """
         transformed_res_list = []
 
-        for chunk_idx, (chunk_res, chunk_ref_pose) in enumerate(zip(res_list, chunk_ref_poses)):
+        for chunk_idx, (chunk_res, chunk_ref_pose, chunk_scale) in enumerate(zip(res_list, chunk_ref_poses, chunk_scales.unbind(dim=1))):
             transformed_chunk_res = []
 
             # Get the predicted chunk2world pose
@@ -1482,25 +1518,22 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
                 # Transform geometric outputs based on scene representation type
                 if 'pts3d' in view_res:
-                    # Transform pointmap from chunk coordinates to world coordinates
-                    pts3d_chunk = view_res['pts3d'] / \
-                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)  # (B, H, W, 3)
+                    # 1. 先应用chunk-specific scale缩放
+                    pts3d_scaled = view_res['pts3d'] * chunk_scale.unsqueeze(-1).unsqueeze(-1)
+                    # 2. 再应用SE3变换到世界坐标系
                     pts3d_world = self._transform_points_to_world(
-                        pts3d_chunk, chunk_trans, chunk_quats, img_shape
+                        pts3d_scaled, chunk_trans, chunk_quats, img_shape
                     )
-                    transformed_view_res['pts3d'] = pts3d_world * \
-                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)
+                    transformed_view_res['pts3d'] = pts3d_world
 
                 if 'ray_origins' in view_res:
-                    # Transform ray origins from chunk coordinates to world coordinates
-                    ray_origins_chunk = view_res['ray_origins'] / \
-                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)  # (B, H, W, 3)
+                    # 1. 先应用chunk-specific scale缩放
+                    ray_origins_scaled = view_res['ray_origins'] * chunk_scale.unsqueeze(-1).unsqueeze(-1)
+                    # 2. 再应用SE3变换到世界坐标系
                     ray_origins_world = self._transform_points_to_world(
-                        ray_origins_chunk, chunk_trans, chunk_quats, img_shape
+                        ray_origins_scaled, chunk_trans, chunk_quats, img_shape
                     )
-                    transformed_view_res['ray_origins'] = ray_origins_world * \
-                        view_res['metric_scaling_factor'].unsqueeze(-1).unsqueeze(-1)
-
+                    transformed_view_res['ray_origins'] = ray_origins_world
 
                 if 'ray_directions' in view_res:
                     if self.scene_rep_type in [
@@ -1510,24 +1543,21 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                         "raymap+depth+confidence+mask",
                     ]:
                         # Transform ray directions (rotation only), if using raymap-based representation because it's in global coordinates
-                        ray_directions_chunk = view_res['ray_directions']  # (B, H, W, 3)
                         ray_directions_world = self._transform_directions_to_world(
-                            ray_directions_chunk, chunk_trans, chunk_quats, img_shape
+                            view_res['ray_directions'], chunk_trans, chunk_quats, img_shape
                         )
                         transformed_view_res['ray_directions'] = ray_directions_world
                     else:
                         transformed_view_res['ray_directions'] = view_res['ray_directions']
 
                 if 'cam_trans' in view_res:
-                    # Transform camera translation from chunk coordinates to world coordinates
-                    cam_trans_chunk = view_res['cam_trans'] / \
-                        view_res['metric_scaling_factor']  # (B, 3)
-                    cam_quats_chunk = view_res['cam_quats']  # (B, 4)
+                    # 1. 先应用chunk-specific scale缩放
+                    cam_trans_scaled = view_res['cam_trans'] * chunk_scale
+                    # 2. 再应用SE3变换到世界坐标系
                     cam_trans_world, cam_quats_world = self._transform_pose_to_world(
-                        cam_trans_chunk, cam_quats_chunk, chunk_trans, chunk_quats
+                        cam_trans_scaled, view_res['cam_quats'], chunk_trans, chunk_quats
                     )
-                    transformed_view_res['cam_trans'] = cam_trans_world * \
-                        view_res['metric_scaling_factor']
+                    transformed_view_res['cam_trans'] = cam_trans_world
                     transformed_view_res['cam_quats'] = cam_quats_world
 
                 transformed_chunk_res.append(transformed_view_res)
@@ -1959,6 +1989,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
             all_chunk_final_features = []  # 收集所有chunk的完整final features结构体
             all_chunk_intermediate_features = []  # 收集每个chunk的intermediate features
             all_chunk_encoder_features_across_views = []
+            all_chunk_scale_features = []  # 收集每个chunk的scale features
 
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * chunk_size
@@ -1966,7 +1997,8 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 chunk_views = views[start_idx:end_idx]
 
                 # Per-chunk encode + info sharing
-                chunk_encoder_features = self._encode_n_views(chunk_views)
+                chunk_encoder_features, chunk_encoder_registers_across_views = self._encode_n_views(chunk_views)
+
                 with torch.autocast("cuda", enabled=False):
                     chunk_encoder_features = self._encode_and_fuse_optional_geometric_inputs(
                         chunk_views, chunk_encoder_features
@@ -1981,6 +2013,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 )  # (B, C, 1)
                 info_sharing_input = MultiViewTransformerInput(
                     features=chunk_encoder_features,
+                    additional_input_tokens_per_view=chunk_encoder_registers_across_views,
                     additional_input_tokens=input_scale_token,
                 )
                 if self.info_sharing_return_type == "no_intermediate_features":
@@ -1992,54 +2025,38 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                         chunk_intermediate_features,
                     ) = self.info_sharing(info_sharing_input)
 
-                # 直接收集完整的chunk_final_features结构体和对应的intermediate features
+                # 收集完整的chunk_final_features结构体和对应的intermediate features
                 all_chunk_final_features.append(chunk_final_features)
                 all_chunk_intermediate_features.append(chunk_intermediate_features)
-        
 
-        # # Step 2: Inter-chunk fusion - 把所有views的features当作输入
-        # # 从all_chunk_final_features中提取所有views的features用于fusion
-        # all_view_features_for_fusion = []
-        # for chunk_final_features,chunk_encoder_features in zip(all_chunk_final_features, all_chunk_encoder_features_across_views):
-        #     chunk_final_features_stacked = torch.stack(chunk_final_features.features, dim=2)  # (B, C, V, H, W)
-        #     chunk_encoder_features_stacked = torch.stack(chunk_encoder_features, dim=2)  # (B, C, V, H, W)
-        #     # chunk_semantic_bias = self._chunk_attn_pooling(chunk_final_features_stacked).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1, 1)
-        #     # # 把chunk_semantic_bias加到每个view的feature上
-        #     # chunk_final_features_stacked = chunk_final_features_stacked + chunk_semantic_bias
-        #     # chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_stacked, 'b c v h w -> b c (v h) w')
-        #     # chunk_encoder_features_flatten_to_H_dim = rearrange(chunk_encoder_features_stacked, 'b c v h w -> b c (v h) w')
-        #     # # concat at channel dim
-        #     # chunk_final_features_flatten_to_H_dim = torch.cat([chunk_final_features_flatten_to_H_dim, chunk_encoder_features_flatten_to_H_dim], dim=1)  # (B, 768 + 1024, V*H, W)
-
-        #     chunk_final_features_concat = torch.cat([chunk_final_features_stacked, chunk_encoder_features_stacked], dim=1)  # (B, 768 + 1024, V, H, W)
-        #     chunk_first_view_embedding_rearranged = rearrange(self.chunk_first_view_embedding, 'c -> 1 c 1 1 1')  # (1, C, 1, 1, 1)
-        #     chunk_first_view_embedding_rearranged = torch.cat([chunk_first_view_embedding_rearranged] + \
-        #                             (len(chunk_final_features.features)-1)*[torch.zeros_like(chunk_first_view_embedding_rearranged)], dim=2)  # (1, C, V, 1, 1)
-        #     chunk_final_features_flatten_to_H_dim = chunk_final_features_concat + chunk_first_view_embedding_rearranged  # (B, C, V, H, W)
-        #     chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_flatten_to_H_dim, 'b c v h w -> b c (v h) w')
-
-        #     all_view_features_for_fusion.append(chunk_final_features_flatten_to_H_dim)
+                # 保存每个chunk的scale features用于inter-chunk fusion
+                all_chunk_scale_features.append(chunk_final_features.additional_token_features)
 
         # Step 2: Inter-chunk fusion - 把所有views的features当作输入
         all_view_features_for_fusion = []
         for chunk_final_features, chunk_intermediate_features in zip(all_chunk_final_features, all_chunk_intermediate_features):
             chunk_intermediate_features_stacked = torch.stack(chunk_intermediate_features[1].features, dim=2)  # (B, C, V, H, W)
             chunk_encoder_features_stacked = torch.stack(chunk_encoder_features, dim=2)  # (B, C, V, H, W)
+            # use self.inter_chunk_encoder_proj to project chunk_encoder_features_stacked to the same channel dimension as chunk_intermediate_features_stacked
+            chunk_encoder_features_stacked = rearrange(chunk_encoder_features_stacked, "b c v h w -> b v h w c")
+            chunk_encoder_features_stacked = self.inter_chunk_encoder_proj(chunk_encoder_features_stacked)
+            chunk_encoder_features_stacked = rearrange(chunk_encoder_features_stacked, "b v h w c -> b c v h w")
 
-            chunk_final_features_concat = torch.cat([chunk_intermediate_features_stacked, chunk_encoder_features_stacked], dim=1)  # (B, 768 + 1024, V, H, W)
-            # chunk_first_view_embedding_rearranged = rearrange(self.chunk_first_view_embedding, 'c -> 1 c 1 1 1')  # (1, C, 1, 1, 1)
-            # chunk_first_view_embedding_rearranged = torch.cat([chunk_first_view_embedding_rearranged] + \
-            #                         (len(chunk_final_features.features)-1)*[torch.zeros_like(chunk_first_view_embedding_rearranged)], dim=2)  # (1, C, V, 1, 1)
-    
+            chunk_final_features_added = chunk_intermediate_features_stacked + chunk_encoder_features_stacked  # (B, C, V, H, W)
+
             # self.chunk_view_embedding是一个nn.embedding，直接根据view index取对应的embedding
             chunk_view_embedding = self.chunk_view_embedding(
                 torch.arange(len(chunk_final_features.features), device=chunk_final_features.features[0].device)
             )  # (V, C)
             chunk_view_embedding_rearranged = rearrange(chunk_view_embedding, 'v c -> 1 c v 1 1')  # (1, C, V, 1, 1)
-            chunk_final_features_flatten_to_H_dim = chunk_final_features_concat + chunk_view_embedding_rearranged  # (B, C, V, H, W)
+            chunk_final_features_flatten_to_H_dim = chunk_final_features_added + chunk_view_embedding_rearranged  # (B, C, V, H, W)
             chunk_final_features_flatten_to_H_dim = rearrange(chunk_final_features_flatten_to_H_dim, 'b c v h w -> b c (v h) w')
 
             all_view_features_for_fusion.append(chunk_final_features_flatten_to_H_dim)
+
+        # 构建per-view scale tokens用于inter-chunk fusion
+        # all_chunk_scale_features: list of tensors, each (B, C, 1)
+        per_view_scale_tokens = all_chunk_scale_features
 
         # Per-chunk info sharing
         input_scale_token = (
@@ -2050,7 +2067,9 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
         inter_fusion_input = MultiViewTransformerInput(
             features=all_view_features_for_fusion,  # n个views的features
-            additional_input_tokens=input_scale_token  
+            additional_input_tokens=input_scale_token,
+            additional_input_tokens_per_view=per_view_scale_tokens,  # 每个chunk的scale features
+            # per_view_additional_tokens=per_view_scale_tokens  # 每个chunk的scale features
         )
 
         if self.inter_chunk_fusion_return_type == "no_intermediate_features":
@@ -2060,6 +2079,32 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                 fused_features,
                 fused_intermediate_features,
             ) = self.inter_chunk_fusion(inter_fusion_input)
+
+        # 从fusion输出中提取chunk-specific scales
+        if fused_features.additional_token_features_per_view is not None:
+            fused_scale_features = fused_features.additional_token_features_per_view  # list of (B, C, 1), length = num_chunks
+            fused_scale_features = torch.stack(fused_scale_features, dim=1).squeeze(-1)  # (B, num_chunks, C)
+
+            # 将chunk维度和batch维度合并，一次性预测所有chunk的scale因子
+            B, num_chunks, C = fused_scale_features.shape
+            fused_scale_features_reshaped = fused_scale_features.view(B * num_chunks, C, 1)  # (B*num_chunks, C, 1)
+
+            chunk_scales_output = self.scale_head(
+                PredictionHeadTokenInput(last_feature=fused_scale_features_reshaped)
+            )
+
+            chunk_scales_output = self.scale_adaptor(
+                AdaptorInput(
+                    adaptor_feature=chunk_scales_output.decoded_channels,
+                    output_shape_hw=img_shape, # Not used in scale adaptor
+                )
+            )
+            chunk_scales_output = chunk_scales_output.value.squeeze(-1)  # (B*num_chunks, 1, 1) -> (B*num_chunks,1)
+
+            chunk_scales = chunk_scales_output.view(B, num_chunks, 1)  # (B, num_chunks, 1)
+        else:
+            # fallback：使用全局scale
+            chunk_scales = torch.ones(batch_size_per_view, num_chunks, 1, device=self.device)
 
         # Step 3: Pose estimation for each chunk's ref view (第一个view是ref view)
         chunk_ref_poses = []
@@ -2160,6 +2205,10 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
                             img_shape=img_shape,
                             memory_efficient_inference=memory_efficient_inference,
                         )
+                    )
+
+                    scale_final_output = torch.ones_like(
+                        scale_final_output
                     )
 
                     # Prepare the final scene representation for all views
@@ -2459,7 +2508,7 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
 
 
         # Step 5: Transform chunk outputs to unified world coordinate system
-        transformed_res_list = self._transform_chunk_output_to_world(res_list, chunk_ref_poses, img_shape)
+        transformed_res_list = self._transform_chunk_output_to_world(res_list, chunk_ref_poses, chunk_scales, img_shape)
 
         # Step 6: Reorganize outputs by view order
         # Flatten the chunked results into a single list of view results
@@ -2467,8 +2516,13 @@ class MapAnythingChunked(nn.Module, PyTorchModelHubMixin):
         for chunk_res in transformed_res_list:
             final_res.extend(chunk_res)
 
-        return final_res
+        # delete metric_scaling_factor from final_res 
+        for view_res in final_res:
+            if "metric_scaling_factor" in view_res:
+                del view_res["metric_scaling_factor"]
 
+        return final_res
+        
 
 
     def _configure_geometric_input_config(

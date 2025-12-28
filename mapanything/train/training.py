@@ -487,154 +487,153 @@ def train_one_epoch(
             )  # scale the loss relative to the number of views (base is 2 views)
         loss_value = float(loss)
 
-        # Debug: Save predictions and GT point clouds as PLY files periodically
-        if train_tools.is_main_process() and args.output_dir and data_iter_step % 1000 == 0 and data_iter_step >0:  # Save every 1000sh iterations
-            debug_dir = os.path.join(args.output_dir, "debug")
-            os.makedirs(debug_dir, exist_ok=True)
+        # Debug: Visualize one batch with Rerun periodically
+        if train_tools.is_main_process() and args.output_dir and data_iter_step % 1000 == 0 and data_iter_step >= 0:  # Save every 1000 iterations
+            try:
+                import rerun as rr
+                debug_dir = os.path.join(args.output_dir, "debug")
+                os.makedirs(debug_dir, exist_ok=True)
 
-            def save_pointcloud_as_ply(points, colors, filename):
-                """Save point cloud as PLY file with colors."""
-                if points is None or points.numel() == 0:
-                    return
+                # Initialize Rerun for this debug session
+                rr.init(f"MapAnything_Debug_Epoch{epoch}_Iter{data_iter_step}")
+                rr.set_time("stable_time", sequence=data_iter_step)
 
-                # Flatten to (N, 3) if needed
-                if points.dim() == 4:  # (B, H, W, 3)
-                    B, H, W, C = points.shape
-                    points = points.view(B * H * W, C)
-                    if colors is not None and colors.dim() == 4:
-                        colors = colors.view(B * H * W, -1)
+                # Log world coordinate system
+                rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
-                # Convert to numpy
-                points_np = points.detach().cpu().numpy()
-                if colors is not None:
-                    colors_np = colors.detach().cpu().numpy()
-                    if colors_np.shape[-1] == 1:  # grayscale
-                        colors_np = np.repeat(colors_np, 3, axis=-1)
-                    elif colors_np.shape[-1] == 3:  # already RGB
-                        pass
-                    else:
-                        colors_np = np.ones_like(points_np) * 128  # default gray
-                else:
-                    colors_np = np.ones_like(points_np) * 128  # default gray
+                # Visualize each view
+                for view_idx in range(len(batch)):  # Limit to first 2 views for simplicity
+                    pred_key = f"pred{view_idx + 1}"
+                    gt_key = f"view{view_idx + 1}"
 
-                # Ensure colors are in 0-255 range
-                colors_np = np.clip(colors_np, 0, 255).astype(np.uint8)
+                    if pred_key in preds and gt_key in preds:
+                        # Get predicted and GT point clouds
+                        pred_pts3d = preds[pred_key].get("pts3d").detach()
+                        gt_pts3d = preds[gt_key].get("pts3d").detach()
+                        gt_valid_mask = preds[gt_key].get("valid_mask").detach()
 
-                # Write PLY file
-                with open(filename, 'w') as f:
-                    # Header
-                    f.write("ply\n")
-                    f.write("format ascii 1.0\n")
-                    f.write(f"element vertex {len(points_np)}\n")
-                    f.write("property float x\n")
-                    f.write("property float y\n")
-                    f.write("property float z\n")
-                    f.write("property uchar red\n")
-                    f.write("property uchar green\n")
-                    f.write("property uchar blue\n")
-                    f.write("end_header\n")
+                        # Get RGB colors from input images
+                        from mapanything.utils.image import rgb
+                        img_tensor = batch[view_idx]["img"]  # (B, 3, H, W) normalized
+                        data_norm_type = batch[view_idx]["data_norm_type"][0]
+                        img_rgb_01 = rgb(img_tensor, data_norm_type)  # (B, H, W, 3) in 0-1 range
+                        img_rgb = (img_rgb_01 * 255).astype(np.uint8)
 
-                    # Data
-                    for point, color in zip(points_np, colors_np):
-                        f.write(f"{point[0]} {point[1]} {point[2]} {int(color[0])} {int(color[1])} {int(color[2])}\n")
+                        # Extract camera parameters from model predictions (post-process like inference.py)
+                        pred_output = preds[pred_key]
 
-            # Create a subfolder for this iteration
-            iter_dir = os.path.join(debug_dir, f"iter_{data_iter_step}")
-            os.makedirs(iter_dir, exist_ok=True)
+                        # Extract intrinsics from ray_directions if available
+                        intrinsics = None
+                        if 'ray_directions' in pred_output:
+                            from mapanything.utils.geometry import recover_pinhole_intrinsics_from_ray_directions
+                            intrinsics = recover_pinhole_intrinsics_from_ray_directions(pred_output['ray_directions'])
+                            if isinstance(intrinsics, torch.Tensor):
+                                intrinsics = intrinsics.detach().cpu().numpy()
+                            # Take first batch only for visualization
+                            if intrinsics is not None and intrinsics.ndim > 2:
+                                intrinsics = intrinsics[0]
 
-            # Save each view separately
-            for view_idx in range(n_views):
-                pred_key = f"pred{view_idx + 1}"
-                gt_key = f"view{view_idx + 1}"
+                        # Extract camera poses from cam_trans and cam_quats if available
+                        extrinsics = None
+                        if 'cam_trans' in pred_output and 'cam_quats' in pred_output:
+                            from mapanything.utils.geometry import quaternion_to_rotation_matrix
+                            cam_trans = pred_output['cam_trans']  # (B, 3)
+                            cam_quats = pred_output['cam_quats']  # (B, 4)
 
-                if pred_key in preds and gt_key in preds:
-                    chunk_idx = preds[pred_key].get("chunk_idx")
-                    chunk_suffix = f"_chunk_{chunk_idx}" if chunk_idx is not None else ""
+                            # Convert quaternions to rotation matrices
+                            rotation_matrices = quaternion_to_rotation_matrix(cam_quats)  # (B, 3, 3)
 
-                    # Get predicted point clouds
-                    pred_pts3d = preds[pred_key].get("pts3d")
+                            # Create 4x4 pose matrices
+                            batch_size = cam_trans.shape[0]
+                            pose_matrices = torch.eye(4, device=cam_trans.device).unsqueeze(0).repeat(batch_size, 1, 1)
+                            pose_matrices[:, :3, :3] = rotation_matrices
+                            pose_matrices[:, :3, 3] = cam_trans
 
-                    # Get GT point clouds
-                    gt_pts3d = preds[gt_key].get("pts3d")
-                    gt_valid_mask = preds[gt_key].get("valid_mask")
+                            extrinsics = pose_matrices
+                            if isinstance(extrinsics, torch.Tensor):
+                                extrinsics = extrinsics.detach().cpu().numpy()
+                            # Take first batch only for visualization
+                            if extrinsics is not None and extrinsics.ndim > 2:
+                                extrinsics = extrinsics[0]  # Shape: (4, 4)
 
-                    # Get RGB colors from input images using the project's rgb function
-                    from mapanything.utils.image import rgb
-                    img_tensor = batch[view_idx]["img"]  # (B, 3, H, W) normalized
-                    data_norm_type = batch[view_idx]["data_norm_type"][0]
-                    # Use rgb function to properly denormalize (returns 0-1 range)
-                    img_rgb_01 = rgb(img_tensor, data_norm_type)  # (B, H, W, 3) in 0-1 range
-                    # Convert to 0-255 range uint8 for PLY
-                    img_rgb = torch.from_numpy((img_rgb_01 * 255).astype(np.uint8)).to(device)
+                        # Take first batch image for visualization
+                        if img_rgb.ndim == 4:  # (B, H, W, 3)
+                            img_rgb_vis = img_rgb[0]  # Shape: (H, W, 3)
+                        else:
+                            img_rgb_vis = img_rgb
 
-                    # Save predicted point cloud for this view
-                    if pred_pts3d is not None:
-                        if pred_pts3d.dim() == 4:  # (B, H, W, 3)
-                            B = pred_pts3d.shape[0]
-                            for batch_idx in range(B):
-                                pred_pts3d_single = pred_pts3d[batch_idx]  # (H, W, 3)
-                                pred_colors_single = img_rgb[batch_idx]  # (H, W, 3)
-                                pred_pts3d_flat = pred_pts3d_single.reshape(-1, 3)
-                                pred_colors_flat = pred_colors_single.reshape(-1, 3)
+                        # Log camera
+                        if intrinsics is not None and extrinsics is not None:
+                            height, width = img_rgb_vis.shape[:2]
+                            rr.log(
+                                f"view_{view_idx}/camera",
+                                rr.Transform3D(translation=extrinsics[:3, 3], mat3x3=extrinsics[:3, :3])
+                            )
+                            rr.log(
+                                f"view_{view_idx}/camera/pinhole",
+                                rr.Pinhole(
+                                    image_from_camera=intrinsics,
+                                    height=height,
+                                    width=width,
+                                    camera_xyz=rr.ViewCoordinates.RDF,
+                                    image_plane_distance=1.0
+                                )
+                            )
+                            rr.log(
+                                f"view_{view_idx}/camera/pinhole/rgb",
+                                rr.Image(img_rgb_vis)
+                            )
 
-                                pred_filename = f"view_{view_idx}_batch_{batch_idx}_pred{chunk_suffix}_epoch_{epoch}_iter_{data_iter_step}.ply"
-                                pred_path = os.path.join(iter_dir, pred_filename)
-                                save_pointcloud_as_ply(pred_pts3d_flat, pred_colors_flat, pred_path)
-                                print(f"Saved view {view_idx} batch {batch_idx} predicted point clouds to {pred_path}")
-                        else:  # Assume (H*W, 3), B=1
-                            pred_colors = img_rgb.reshape(-1, 3)
-                            pred_pts3d_flat = pred_pts3d.reshape(-1, 3)
+                        # Log predicted point cloud
+                        if pred_pts3d is not None and pred_pts3d.numel() > 0:
+                            if pred_pts3d.dim() == 4:  # (B, H, W, 3)
+                                pred_pts3d_flat = pred_pts3d[0].reshape(-1, 3)  # Take first batch
+                                pred_colors_flat = img_rgb.reshape(-1, 3)
+                            else:
+                                pred_pts3d_flat = pred_pts3d.reshape(-1, 3)
+                                pred_colors_flat = img_rgb.reshape(-1, 3)
 
-                            pred_filename = f"view_{view_idx}_pred{chunk_suffix}_epoch_{epoch}_iter_{data_iter_step}.ply"
-                            pred_path = os.path.join(iter_dir, pred_filename)
-                            save_pointcloud_as_ply(pred_pts3d_flat, pred_colors, pred_path)
-                            print(f"Saved view {view_idx} predicted point clouds to {pred_path}")
+                            rr.log(
+                                f"view_{view_idx}/pred_pointcloud",
+                                rr.Points3D(pred_pts3d_flat.detach().cpu().numpy(), colors=pred_colors_flat.reshape(-1, 3), radii=0.01)
+                            )
 
-                    # Save GT point cloud for this view
-                    if gt_pts3d is not None and gt_valid_mask is not None:
-                        if gt_valid_mask.dim() == 4:  # (B, H, W, 1)
-                            gt_valid_mask = gt_valid_mask.squeeze(-1)
+                        # Log GT point cloud
+                        if gt_pts3d is not None and gt_valid_mask is not None and gt_pts3d.numel() > 0:
+                            if gt_valid_mask.dim() == 4:
+                                gt_valid_mask = gt_valid_mask.squeeze(-1)
 
-                        if gt_valid_mask.dim() == 3:  # (B, H, W)
-                            B = gt_valid_mask.shape[0]
-                            for batch_idx in range(B):
-                                gt_pts3d_masked = gt_pts3d[batch_idx][gt_valid_mask[batch_idx]]
-                                gt_colors_masked = img_rgb[batch_idx][gt_valid_mask[batch_idx]]
+                            if gt_valid_mask.dim() == 3:  # (B, H, W)
+                                gt_pts3d_masked = gt_pts3d[0][gt_valid_mask[0]]  # Take first batch
+                                gt_colors_masked = img_rgb_vis[gt_valid_mask[0].detach().cpu().numpy()]  # Use img_rgb_vis (already batch-removed)
+                            else:
+                                gt_pts3d_masked = gt_pts3d[gt_valid_mask]
+                                gt_colors_masked = img_rgb_vis.reshape(-1, 3)[gt_valid_mask.reshape(-1).detach().cpu().numpy()]  # Use img_rgb_vis
 
-                                gt_filename = f"view_{view_idx}_batch_{batch_idx}_gt{chunk_suffix}_epoch_{epoch}_iter_{data_iter_step}.ply"
-                                gt_path = os.path.join(iter_dir, gt_filename)
-                                save_pointcloud_as_ply(gt_pts3d_masked, gt_colors_masked, gt_path)
-                                print(f"Saved view {view_idx} batch {batch_idx} GT point clouds to {gt_path}")
-                        else:  # Assume (H*W,), B=1
-                            gt_pts3d_masked = gt_pts3d[gt_valid_mask]
-                            gt_colors_masked = img_rgb.reshape(-1, 3)[gt_valid_mask.reshape(-1)]
+                            rr.log(
+                                f"view_{view_idx}/gt_pointcloud",
+                                rr.Points3D(gt_pts3d_masked.detach().cpu().numpy(), colors=gt_colors_masked, radii=0.01)
+                            )
 
-                            gt_filename = f"view_{view_idx}_gt{chunk_suffix}_epoch_{epoch}_iter_{data_iter_step}.ply"
-                            gt_path = os.path.join(iter_dir, gt_filename)
-                            save_pointcloud_as_ply(gt_pts3d_masked, gt_colors_masked, gt_path)
-                            print(f"Saved view {view_idx} GT point clouds to {gt_path}")
+                # Save Rerun recording
+                rr_path = os.path.join(debug_dir, f"debug_epoch_{epoch}_iter_{data_iter_step}.rrd")
+                rr.save(rr_path)
+                print(f"Saved debug visualization to {rr_path}")
 
-            # Save metadata as text file
-            metadata_filename = f"metadata_epoch_{epoch}_iter_{data_iter_step}.txt"
-            metadata_path = os.path.join(iter_dir, metadata_filename)
-            with open(metadata_path, 'w') as f:
-                f.write(f"Epoch: {epoch}\n")
-                f.write(f"Iteration: {data_iter_step}\n")
-                f.write(f"Loss: {loss_value}\n")
-                f.write(f"Loss Details: {loss_details}\n")
-                f.write(f"Number of views: {n_views}\n")
-            print(f"Saved metadata to {metadata_path}")
+                # Save metadata
+                metadata_path = os.path.join(debug_dir, f"metadata_epoch_{epoch}_iter_{data_iter_step}.txt")
+                with open(metadata_path, 'w') as f:
+                    f.write(f"Epoch: {epoch}\n")
+                    f.write(f"Iteration: {data_iter_step}\n")
+                    f.write(f"Loss: {loss_value}\n")
+                    f.write(f"Loss Details: {loss_details}\n")
+                    f.write(f"Number of views: {n_views}\n")
+                print(f"Saved metadata to {metadata_path}")
 
-            # Save metadata as text file
-            metadata_filename = f"metadata_epoch_{epoch}_iter_{data_iter_step}.txt"
-            metadata_path = os.path.join(debug_dir, metadata_filename)
-            with open(metadata_path, 'w') as f:
-                f.write(f"Epoch: {epoch}\n")
-                f.write(f"Iteration: {data_iter_step}\n")
-                f.write(f"Loss: {loss_value}\n")
-                f.write(f"Loss Details: {loss_details}\n")
-                f.write(f"Number of views: {n_views}\n")
-            print(f"Saved metadata to {metadata_path}")
+            except ImportError:
+                print("Rerun not available, skipping debug visualization")
+            except Exception as e:
+                print(f"Debug visualization failed: {e}")
 
         if not math.isfinite(loss_value) or (loss_value > 1000):
             print("Loss is {}, stopping training".format(loss_value), force=True)

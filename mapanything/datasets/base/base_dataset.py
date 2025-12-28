@@ -92,6 +92,8 @@ class BaseDataset(EasyDataset):
         # Update the number of views if necessary and make it a list if variable_num_views is True
         if self.variable_num_views and self.num_views > self.num_views_min:
             self.num_views = list(range(self.num_views_min, self.num_views + 1))
+            # Here we add a little more restriction: self.num_views % 2 == 0
+            self.num_views = [n for n in self.num_views if n % 2 == 0]
 
         # Initialize the image normalization type
         if data_norm_type in IMAGE_NORMALIZATION_DICT.keys():
