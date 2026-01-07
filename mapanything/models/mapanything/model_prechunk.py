@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
+from mapanything.models.mapanything.mv_compression import MultiScaleViewCompressionUNet
 from mapanything.utils.geometry import (
     apply_log_to_norm,
     convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap,
@@ -105,6 +106,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         torch_hub_force_reload: bool = False,
         use_register_tokens_from_encoder: bool = False,
         info_sharing_mlp_layer_str: str = "mlp",
+        use_view_compression: bool = False,
+        view_compression_config: Dict = None,
     ):
         """
         Multi-view model containing an image encoder fused with optional geometric modalities followed by a multi-view attention transformer and respective downstream heads.
@@ -124,6 +127,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             torch_hub_force_reload (bool): Whether to force reload the encoder from torch hub. (default: False)
             use_register_tokens_from_encoder (bool): Whether to use register tokens from encoder. (default: False)
             info_sharing_mlp_layer_str (str): Type of MLP layer to use in the multi-view transformer. Useful for DINO init of the multi-view transformer. Options: "mlp" or "swiglufused". (default: "mlp")
+            use_view_compression (bool): Whether to use view compression module. (default: False)
+            view_compression_config (Dict): Configuration for the view compression module. (default: None)
         """
         super().__init__()
 
@@ -139,6 +144,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         self.torch_hub_force_reload = torch_hub_force_reload
         self.use_register_tokens_from_encoder = use_register_tokens_from_encoder
         self.info_sharing_mlp_layer_str = info_sharing_mlp_layer_str
+        self.use_view_compression = use_view_compression
+        self.view_compression_config = view_compression_config
         self.class_init_args = {
             "name": self.name,
             "encoder_config": self.encoder_config,
@@ -151,6 +158,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             "torch_hub_force_reload": self.torch_hub_force_reload,
             "use_register_tokens_from_encoder": self.use_register_tokens_from_encoder,
             "info_sharing_mlp_layer_str": self.info_sharing_mlp_layer_str,
+            "use_view_compression": self.use_view_compression,
+            "view_compression_config": self.view_compression_config,
         }
 
         # Get relevant parameters from the configs
@@ -210,6 +219,14 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         # During inference extended to (B, C, T), where T is the number of tokens (i.e., 1)
         self.scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim))
         torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
+
+        # Initialize view compression module if required
+        if self.use_view_compression:
+            self.view_compression = MultiScaleViewCompressionUNet(
+                **self.view_compression_config
+            )
+        else:
+            self.view_compression = None
 
         # Set the MLP layer config for the info sharing transformer
         if info_sharing_mlp_layer_str == "mlp":
@@ -1511,8 +1528,10 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         2. Encodes the optional geometric inputs (ray directions, depths, camera rotations, camera translations).
         3. Fuses the encoded features from the N input views and the optional geometric inputs using addition and normalization.
         4. Information sharing across the encoded features and a scale token using a multi-view attention transformer with chunked processing.
-        5. Passes the final features from transformer through the prediction heads.
-        6. Returns the processed final outputs for N views.
+        5. Applies view compression to reduce feature dimensions (if enabled).
+        6. Merges chunked features and processes remaining transformer layers.
+        7. Passes the final features from transformer through the prediction heads.
+        8. Returns the processed final outputs for N views.
 
         Assumption:
         - All the input views and dense geometric inputs have the same image shape.
@@ -1540,7 +1559,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         batch_size_per_view, _, height, width = views[0]["img"].shape
         img_shape = (int(height), int(width))
         num_views = len(views)
-        num_chunks = num_views
+        num_chunks = num_views // 2
 
         # 验证输入约束
         assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
@@ -1591,7 +1610,20 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
                 all_chunk_intermediate_features.append(chunk_intermediate_info_sharing_multi_view_feat)
 
 
-        # Step 2: Merge Chunks
+        # Step 2: Apply View Compression (if enabled)
+        chunk_compressed_tokens = []  # NEW: 保存所有chunk的压缩token用于cross attention
+        if self.use_view_compression:
+            # Prepare features for compression
+            for chunk_idx, chunk_state in enumerate(chunked_states):
+                # Stack view features for this chunk: (num_views_in_chunk, B, C, H, W) -> (B, C, H, W*num_views_in_chunk)
+                chunk_view_features = chunk_state.view_features
+                # Apply compression
+                compressed_features = self.view_compression(chunk_view_features)  # (B, C, H, W)
+
+                # NEW: 保存compressed_features作为chunk token用于cross attention
+                chunk_compressed_tokens.append(compressed_features)
+
+        # Step 3: Merge Chunks
         # additional_token_features: list of (B,C,1)
         fused_global_tokens = torch.stack(
             [chunk_state.additional_token_features for chunk_state in chunked_states],
@@ -1613,10 +1645,18 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
                 chunk_state.view_features
             )  # list of (B,C,H,W)
 
+        # NEW: 预先拼接所有chunk的压缩token用于cross attention
+        kv_tokens = None
+        if chunk_compressed_tokens:
+            # chunk_compressed_tokens: list of (B, C, H, W), length = num_chunks
+            kv_tokens = torch.cat(chunk_compressed_tokens, dim=-1)  # (B, C, H, num_chunks*W)
+            kv_tokens = kv_tokens.permute(0, 2, 3, 1).flatten(1, 2)  # (B, H*num_chunks*W, C)
+
         fused_chunk_states = ChunkedPhaseState(
             view_features=fused_views_features,
             additional_token_features=fused_global_tokens,
             additional_token_features_per_view=fused_global_registers_per_view,
+            kv_tokens=kv_tokens,  # NEW: 传递预拼接的kv_tokens用于cross attention
             num_additional_tokens_per_view=chunked_states[0].num_additional_tokens_per_view,
             num_spatial_tokens_per_view=chunked_states[0].num_spatial_tokens_per_view,
             batch_size=chunked_states[0].batch_size,
@@ -1624,8 +1664,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             width=chunked_states[0].width,
         )
 
-        # Step 3: Merged phase - 将所有chunks合并处理剩余的transformer层
-        final_info_sharing_multi_view_feat, merged_intermediate_multi_view_features = self.info_sharing.forward(
+        # Step 4: Merged phase - 将所有chunks合并处理剩余的transformer层
+        final_info_sharing_multi_view_feat, merged_intermediate_multi_view_features = self.info_sharing(
             fused_chunk_states,
             mode="merged",
             chunk_layer_threshold=chunk_layer_threshold,

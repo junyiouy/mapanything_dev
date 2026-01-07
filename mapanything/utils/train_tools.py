@@ -823,6 +823,9 @@ def get_parameter_groups(
         else:
             this_weight_decay = weight_decay
             this_lr = lr
+            if this_lr == 0:
+                param.requires_grad = False
+                continue
             if warn_not_in_submodule and submodule_configs is not None:
                 print(
                     f"Warning: Parameter {name} does not belong to any submodule in {submodule_configs.keys()}."

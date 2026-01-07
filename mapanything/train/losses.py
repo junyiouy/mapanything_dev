@@ -14,11 +14,8 @@ from copy import copy, deepcopy
 
 import einops as ein
 import torch
-import open3d as o3d
-import numpy as np
 from mapanything.utils.image import rgb
 import os
-from PIL import Image
 import torch.nn as nn
 
 from mapanything.utils.geometry import (
@@ -80,7 +77,7 @@ def get_loss_terms_and_details(
                     values_after_masking = values[i][mask]
 
                 if values_after_masking.numel() > 0:
-                    view_loss_detail = float(values_after_masking.mean())
+                    view_loss_detail = float(values_after_masking.detach().mean())
                     if view_loss_detail > 0:
                         details[f"{self_name}_{loss_type}_view{i + 1}"] = (
                             view_loss_detail

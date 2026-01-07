@@ -454,6 +454,7 @@ def train_one_epoch(
     ):
         n_views = len(batch)
         epoch_f = epoch + data_iter_step / len(data_loader)
+        is_last = data_iter_step == (len(data_loader) - 1)
 
         # We use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
@@ -488,7 +489,7 @@ def train_one_epoch(
         loss_value = float(loss)
 
         # Debug: Visualize one batch with Rerun periodically
-        if train_tools.is_main_process() and args.output_dir and data_iter_step % 1000 == 0 and data_iter_step >= 0:  # Save every 1000 iterations
+        if train_tools.is_main_process() and args.output_dir and ((data_iter_step % 1000 == 0 and data_iter_step >= 0) or is_last) :  # Save every 1000 iterations or last iteration
             try:
                 import rerun as rr
                 debug_dir = os.path.join(args.output_dir, "debug")
