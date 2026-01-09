@@ -108,6 +108,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         info_sharing_mlp_layer_str: str = "mlp",
         use_view_compression: bool = False,
         view_compression_config: Dict = None,
+        chunk_layer_threshold: int = 16,
     ):
         """
         Multi-view model containing an image encoder fused with optional geometric modalities followed by a multi-view attention transformer and respective downstream heads.
@@ -146,6 +147,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         self.info_sharing_mlp_layer_str = info_sharing_mlp_layer_str
         self.use_view_compression = use_view_compression
         self.view_compression_config = view_compression_config
+        self.chunk_layer_threshold = chunk_layer_threshold
         self.class_init_args = {
             "name": self.name,
             "encoder_config": self.encoder_config,
@@ -160,6 +162,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             "info_sharing_mlp_layer_str": self.info_sharing_mlp_layer_str,
             "use_view_compression": self.use_view_compression,
             "view_compression_config": self.view_compression_config,
+            "chunk_layer_threshold": self.chunk_layer_threshold,
         }
 
         # Get relevant parameters from the configs
@@ -220,13 +223,23 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         self.scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim))
         torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
 
-        # Initialize view compression module if required
+        # Initialize view compression modules if required
         if self.use_view_compression:
-            self.view_compression = MultiScaleViewCompressionUNet(
-                **self.view_compression_config
-            )
+            # Calculate number of global attention layers in merged phase
+            # Global attention layers are at depth_idx % 2 == 0
+            # Starting from chunk_layer_threshold
+            depth = info_sharing_config["module_args"]["depth"]
+            if self.chunk_layer_threshold % 2 == 0:
+                first_global = self.chunk_layer_threshold
+            else:
+                first_global = self.chunk_layer_threshold + 1
+            num_global_layers_in_merged = ((depth - first_global) // 2) + 1
+            self.view_compressions = nn.ModuleList([
+                MultiScaleViewCompressionUNet(**self.view_compression_config)
+                for _ in range(num_global_layers_in_merged)
+            ])
         else:
-            self.view_compression = None
+            self.view_compressions = None
 
         # Set the MLP layer config for the info sharing transformer
         if info_sharing_mlp_layer_str == "mlp":
@@ -1521,7 +1534,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
-    def forward(self, views, memory_efficient_inference=False, chunk_layer_threshold=10, num_chunks=2):
+    def forward(self, views, memory_efficient_inference=False, num_chunks=2):
         """
         Forward pass performing the following operations:
         1. Encodes the N input views (images).
@@ -1565,63 +1578,52 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
         chunk_size = num_views // num_chunks
 
-        with torch.no_grad():
-            # Step 1: Per-chunk processing - 使用transformer的chunked_phase方法
-            chunked_states = []  # 收集所有chunk的ChunkedPhaseState
-            all_chunk_intermediate_features = []  # 收集每个chunk的intermediate features
-            all_chunk_encoder_features_across_views = []
+        # with torch.no_grad():
+        # Step 1: Per-chunk processing - 使用transformer的chunked_phase方法
+        chunked_states = []  # 收集所有chunk的ChunkedPhaseState
+        all_chunk_intermediate_features = []  # 收集每个chunk的intermediate features
+        all_chunk_encoder_features_across_views = []
 
-            for chunk_idx in range(num_chunks):
-                start_idx = chunk_idx * chunk_size
-                end_idx = (chunk_idx + 1) * chunk_size
-                chunk_views = views[start_idx:end_idx]
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = (chunk_idx + 1) * chunk_size
+            chunk_views = views[start_idx:end_idx]
 
-                # Per-chunk encode + info sharing
-                chunk_encoder_features, chunk_encoder_registers_across_views = self._encode_n_views(chunk_views)
+            # Per-chunk encode + info sharing
+            chunk_encoder_features, chunk_encoder_registers_across_views = self._encode_n_views(chunk_views)
 
-                with torch.autocast("cuda", enabled=False):
-                    chunk_encoder_features = self._encode_and_fuse_optional_geometric_inputs(
-                        chunk_views, chunk_encoder_features
-                    )
-                all_chunk_encoder_features_across_views.append(chunk_encoder_features)
-
-                # Per-chunk info sharing - 使用chunked_phase
-                input_scale_token = (
-                    self.scale_token.unsqueeze(0)
-                    .unsqueeze(-1)
-                    .repeat(batch_size_per_view, 1, 1)
-                )  # (B, C, 1)
-                info_sharing_input = MultiViewTransformerInput(
-                    features=chunk_encoder_features,
-                    additional_input_tokens_per_view=chunk_encoder_registers_across_views,
-                    additional_input_tokens=input_scale_token,
+            with torch.autocast("cuda", enabled=False):
+                chunk_encoder_features = self._encode_and_fuse_optional_geometric_inputs(
+                    chunk_views, chunk_encoder_features
                 )
+            all_chunk_encoder_features_across_views.append(chunk_encoder_features)
 
-                # 使用transformer的chunked_phase方法
-                chunked_state, chunk_intermediate_info_sharing_multi_view_feat = self.info_sharing(
-                    info_sharing_input,
-                    mode="chunked",
-                    chunk_layer_threshold=chunk_layer_threshold,
-                )
+            # Per-chunk info sharing - 使用chunked_phase
+            input_scale_token = (
+                self.scale_token.unsqueeze(0)
+                .unsqueeze(-1)
+                .repeat(batch_size_per_view, 1, 1)
+            )  # (B, C, 1)
+            info_sharing_input = MultiViewTransformerInput(
+                features=chunk_encoder_features,
+                additional_input_tokens_per_view=chunk_encoder_registers_across_views,
+                additional_input_tokens=input_scale_token,
+            )
 
-                # 收集chunked state
-                chunked_states.append(chunked_state)
+            # 使用transformer的chunked_phase方法
+            chunked_state, chunk_intermediate_info_sharing_multi_view_feat = self.info_sharing(
+                info_sharing_input,
+                mode="chunked",
+                chunk_layer_threshold=self.chunk_layer_threshold,
+            )
 
-                all_chunk_intermediate_features.append(chunk_intermediate_info_sharing_multi_view_feat)
+            # 收集chunked state
+            chunked_states.append(chunked_state)
+
+            all_chunk_intermediate_features.append(chunk_intermediate_info_sharing_multi_view_feat)
 
 
-        # Step 2: Apply View Compression (if enabled)
-        chunk_compressed_tokens = []  # NEW: 保存所有chunk的压缩token用于cross attention
-        if self.use_view_compression:
-            # Prepare features for compression
-            for chunk_idx, chunk_state in enumerate(chunked_states):
-                # Stack view features for this chunk: (num_views_in_chunk, B, C, H, W) -> (B, C, H, W*num_views_in_chunk)
-                chunk_view_features = chunk_state.view_features
-                # Apply compression
-                compressed_features = self.view_compression(chunk_view_features)  # (B, C, H, W)
-
-                # NEW: 保存compressed_features作为chunk token用于cross attention
-                chunk_compressed_tokens.append(compressed_features)
+        # Step 2: Prepare for merged phase (view compression will be applied dynamically in merged phase)
 
         # Step 3: Merge Chunks
         # additional_token_features: list of (B,C,1)
@@ -1645,18 +1647,11 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
                 chunk_state.view_features
             )  # list of (B,C,H,W)
 
-        # NEW: 预先拼接所有chunk的压缩token用于cross attention
-        kv_tokens = None
-        if chunk_compressed_tokens:
-            # chunk_compressed_tokens: list of (B, C, H, W), length = num_chunks
-            kv_tokens = torch.cat(chunk_compressed_tokens, dim=-1)  # (B, C, H, num_chunks*W)
-            kv_tokens = kv_tokens.permute(0, 2, 3, 1).flatten(1, 2)  # (B, H*num_chunks*W, C)
-
         fused_chunk_states = ChunkedPhaseState(
             view_features=fused_views_features,
             additional_token_features=fused_global_tokens,
             additional_token_features_per_view=fused_global_registers_per_view,
-            kv_tokens=kv_tokens,  # NEW: 传递预拼接的kv_tokens用于cross attention
+            kv_tokens=None,  # Will be computed dynamically in merged phase
             num_additional_tokens_per_view=chunked_states[0].num_additional_tokens_per_view,
             num_spatial_tokens_per_view=chunked_states[0].num_spatial_tokens_per_view,
             batch_size=chunked_states[0].batch_size,
@@ -1668,7 +1663,9 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         final_info_sharing_multi_view_feat, merged_intermediate_multi_view_features = self.info_sharing(
             fused_chunk_states,
             mode="merged",
-            chunk_layer_threshold=chunk_layer_threshold,
+            chunk_layer_threshold=self.chunk_layer_threshold,
+            view_compressions=self.view_compressions,
+            num_chunks=num_chunks,
         )
 
         # collect premerge_intermediate_feature
@@ -2135,6 +2132,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         ignore_pose_inputs: bool = False,
         ignore_depth_scale_inputs: bool = False,
         ignore_pose_scale_inputs: bool = False,
+        # 新增参数
+        record_metrics: bool = False,
     ) -> List[Dict[str, torch.Tensor]]:
         """
         User-friendly inference with strict input validation and automatic conversion.
@@ -2198,6 +2197,9 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         Raises:
             ValueError: For invalid inputs, missing required keys, conflicting modalities, or constraint violations
         """
+        import time
+        metrics_log = {}
+
         # Determine the mixed precision floating point type
         if use_amp:
             if amp_dtype == "fp16":
@@ -2217,32 +2219,20 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
 
         # Validate the input views
         validated_views = validate_input_views_for_inference(views)
-
-        # Transfer the views to the same device as the model
-        ignore_keys = set(
-            [
-                "instance",
-                "idx",
-                "true_shape",
-                "data_norm_type",
-            ]
-        )
+        
+        # Transfer device
+        ignore_keys = {"instance", "idx", "true_shape", "data_norm_type"}
         for view in validated_views:
             for name in view.keys():
-                if name in ignore_keys:
-                    continue
+                if name in ignore_keys: continue
                 val = view[name]
                 if name == "camera_poses" and isinstance(val, tuple):
-                    view[name] = tuple(
-                        x.to(self.device, non_blocking=True) for x in val
-                    )
+                    view[name] = tuple(x.to(self.device, non_blocking=True) for x in val)
                 elif hasattr(val, "to"):
                     view[name] = val.to(self.device, non_blocking=True)
 
-        # Pre-process the input views
         processed_views = preprocess_input_views_for_inference(validated_views)
 
-        # Set the model input probabilities based on input args for ignoring inputs
         self._configure_geometric_input_config(
             use_calibration=not ignore_calibration_inputs,
             use_depth=not ignore_depth_inputs,
@@ -2251,13 +2241,71 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             use_pose_scale=not ignore_pose_scale_inputs,
         )
 
-        # Run the model
+        # --- 阶段 1: 纯净推理 (测量时间和显存) ---
+        if record_metrics and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        
+        start_time = time.perf_counter()
+
         with torch.autocast("cuda", enabled=bool(use_amp), dtype=amp_dtype):
-            preds = self.forward(
+            preds = self(
                 processed_views, memory_efficient_inference=memory_efficient_inference
             )
 
-        # Post-process the model outputs
+        if record_metrics and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            metrics_log["peak_mem_mb"] = torch.cuda.max_memory_allocated() / (1024**2)
+        
+        end_time = time.perf_counter()
+
+        # --- 阶段 2: Kineto Profiler 分析 (计算 FLOPs) ---
+        if record_metrics:
+            print("Starting Kineto Profiler for FLOPs analysis...")
+            try:
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    with_flops=True,
+                    record_shapes=True,
+                ) as prof:
+                    with torch.autocast("cuda", enabled=bool(use_amp), dtype=amp_dtype):
+                        # 再次执行 forward 以便捕捉算子
+                        self(processed_views, memory_efficient_inference=memory_efficient_inference)
+                
+                # 汇总所有算子的 FLOPs
+                total_flops = sum(getattr(event, "flops", 0) for event in prof.key_averages())
+                
+                if total_flops > 0:
+                    metrics_log["total_tflops"] = total_flops / 1e12
+                    metrics_log["avg_view_gflops"] = (total_flops / len(views)) / 1e9
+                else:
+                    metrics_log["total_tflops"] = 0.0
+                    print("Warning: Kineto reported 0 FLOPs. Ensure your PyTorch version supports FLOPs counting for these kernels.")
+
+            except Exception as e:
+                print(f"Warning: Kineto profiling failed: {e}")
+
+        # --- 整理指标与打印 ---
+        if record_metrics:
+            total_time_ms = (end_time - start_time) * 1000
+            metrics_log["inference_time_ms"] = total_time_ms
+            metrics_log["ms_per_view"] = total_time_ms / len(views)
+            
+            self.last_inference_metrics = metrics_log
+            
+            print(f"\n[Inference Metrics] Kineto Mode")
+            print(f" - Total FLOPs: {metrics_log.get('total_tflops', 0):.2f} TFLOPs")
+            print(f" - Avg View FLOPs: {metrics_log.get('avg_view_gflops', 0):.2f} GFLOPs")
+            print(f" - Pure Inference Time: {metrics_log['inference_time_ms']:.2f} ms")
+            print(f" - Peak Memory: {metrics_log.get('peak_mem_mb', 0):.2f} MB")
+
+        if record_metrics:
+            return [None] * len(views)
+        
+        # Post-process
         preds = postprocess_model_outputs_for_inference(
             raw_outputs=preds,
             input_views=processed_views,
@@ -2269,7 +2317,6 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             confidence_percentile=confidence_percentile,
         )
 
-        # Restore the original configuration
-        self._restore_original_geometric_input_config()
 
+        self._restore_original_geometric_input_config()
         return preds

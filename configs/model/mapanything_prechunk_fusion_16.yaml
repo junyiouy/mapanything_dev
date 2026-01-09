@@ -15,11 +15,11 @@ model_config:
   pred_head_config: ${model.pred_head}
   geometric_input_config: ${model.task}
   view_compression_config:
-    # dim, pool_mode='mean', num_heads=8
     dim: 768
     pool_mode: "attn"
     num_heads: 12
   use_view_compression: True
+  chunk_layer_threshold: 16
   # pretrained_checkpoint_path: /wekafs/ict/junyiouy/map-anything/checkpoints/facebook_map-anything.pth
 # Image Normalization Type
 data_norm_type: ${model.encoder.data_norm_type}

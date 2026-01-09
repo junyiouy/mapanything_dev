@@ -1,0 +1,26 @@
+# 默认引用基础模型配置 (假设你在 configs/model/ 下有 mapanything.yaml)
+defaults:
+  - model: mapanything_prechunk_fusion_16_mean_pool
+  - _self_
+
+# 数据集相关设置
+sequence_dir: "/wekafs/ict/junyiouy/SCube-release/waymo_ns_test/testing/2942662230423855469_880_000_900_000"  # 必填项，命令行传入
+camera_types: ["FRONT"]
+modalities: ["image", "intrinsics", "poses"]
+no_metric_scale: false
+reference_idx: 0
+
+# 推理性能设置
+checkpoint: "/wekafs/ict/junyiouy/map-anything/experiments/mapanything/training/prechunk_pre_16_layers_num_view_fusion_per_layer_chunk1_norm/checkpoint-best.pth"    # 必填项，模型权重路径
+device: "cuda"
+no_memory_efficient: false
+record_metrics: true
+
+# 输出设置
+output_dir: "./waymo_output/benchmark"
+
+# 覆盖模型内部的部分配置（可选，例如推理时想换个 Head）
+# model:
+#   model_config:
+#     encoder:
+#       name: "dinov2_large"

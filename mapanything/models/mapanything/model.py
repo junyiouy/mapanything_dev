@@ -2010,6 +2010,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         ignore_pose_inputs: bool = False,
         ignore_depth_scale_inputs: bool = False,
         ignore_pose_scale_inputs: bool = False,
+        # 新增参数，默认关闭，不影响原始逻辑
+        record_metrics: bool = False,
     ) -> List[Dict[str, torch.Tensor]]:
         """
         User-friendly inference with strict input validation and automatic conversion.
@@ -2073,6 +2075,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         Raises:
             ValueError: For invalid inputs, missing required keys, conflicting modalities, or constraint violations
         """
+        import time
+        metrics_log = {}
+
         # Determine the mixed precision floating point type
         if use_amp:
             if amp_dtype == "fp16":
@@ -2092,32 +2097,20 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         # Validate the input views
         validated_views = validate_input_views_for_inference(views)
-
-        # Transfer the views to the same device as the model
-        ignore_keys = set(
-            [
-                "instance",
-                "idx",
-                "true_shape",
-                "data_norm_type",
-            ]
-        )
+        
+        # Transfer device
+        ignore_keys = {"instance", "idx", "true_shape", "data_norm_type"}
         for view in validated_views:
             for name in view.keys():
-                if name in ignore_keys:
-                    continue
+                if name in ignore_keys: continue
                 val = view[name]
                 if name == "camera_poses" and isinstance(val, tuple):
-                    view[name] = tuple(
-                        x.to(self.device, non_blocking=True) for x in val
-                    )
+                    view[name] = tuple(x.to(self.device, non_blocking=True) for x in val)
                 elif hasattr(val, "to"):
                     view[name] = val.to(self.device, non_blocking=True)
 
-        # Pre-process the input views
         processed_views = preprocess_input_views_for_inference(validated_views)
 
-        # Set the model input probabilities based on input args for ignoring inputs
         self._configure_geometric_input_config(
             use_calibration=not ignore_calibration_inputs,
             use_depth=not ignore_depth_inputs,
@@ -2126,13 +2119,71 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             use_pose_scale=not ignore_pose_scale_inputs,
         )
 
-        # Run the model
+        # --- 阶段 1: 纯净推理 (测量时间和显存) ---
+        if record_metrics and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        
+        start_time = time.perf_counter()
+
         with torch.autocast("cuda", enabled=bool(use_amp), dtype=amp_dtype):
-            preds = self.forward(
+            preds = self(
                 processed_views, memory_efficient_inference=memory_efficient_inference
             )
 
-        # Post-process the model outputs
+        if record_metrics and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            metrics_log["peak_mem_mb"] = torch.cuda.max_memory_allocated() / (1024**2)
+        
+        end_time = time.perf_counter()
+
+        # --- 阶段 2: Kineto Profiler 分析 (计算 FLOPs) ---
+        if record_metrics:
+            print("Starting Kineto Profiler for FLOPs analysis...")
+            try:
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    with_flops=True,
+                    record_shapes=True,
+                ) as prof:
+                    with torch.autocast("cuda", enabled=bool(use_amp), dtype=amp_dtype):
+                        # 再次执行 forward 以便捕捉算子
+                        self(processed_views, memory_efficient_inference=memory_efficient_inference)
+                
+                # 汇总所有算子的 FLOPs
+                total_flops = sum(getattr(event, "flops", 0) for event in prof.key_averages())
+                
+                if total_flops > 0:
+                    metrics_log["total_tflops"] = total_flops / 1e12
+                    metrics_log["avg_view_gflops"] = (total_flops / len(views)) / 1e9
+                else:
+                    metrics_log["total_tflops"] = 0.0
+                    print("Warning: Kineto reported 0 FLOPs. Ensure your PyTorch version supports FLOPs counting for these kernels.")
+
+            except Exception as e:
+                print(f"Warning: Kineto profiling failed: {e}")
+
+        # --- 整理指标与打印 ---
+        if record_metrics:
+            total_time_ms = (end_time - start_time) * 1000
+            metrics_log["inference_time_ms"] = total_time_ms
+            metrics_log["ms_per_view"] = total_time_ms / len(views)
+            
+            self.last_inference_metrics = metrics_log
+            
+            print(f"\n[Inference Metrics] Kineto Mode")
+            print(f" - Total FLOPs: {metrics_log.get('total_tflops', 0):.2f} TFLOPs")
+            print(f" - Avg View FLOPs: {metrics_log.get('avg_view_gflops', 0):.2f} GFLOPs")
+            print(f" - Pure Inference Time: {metrics_log['inference_time_ms']:.2f} ms")
+            print(f" - Peak Memory: {metrics_log.get('peak_mem_mb', 0):.2f} MB")
+
+        if record_metrics:
+            return [None] * len(views)
+        
+        # Post-process
         preds = postprocess_model_outputs_for_inference(
             raw_outputs=preds,
             input_views=processed_views,
@@ -2144,7 +2195,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             confidence_percentile=confidence_percentile,
         )
 
-        # Restore the original configuration
-        self._restore_original_geometric_input_config()
 
+        self._restore_original_geometric_input_config()
         return preds
