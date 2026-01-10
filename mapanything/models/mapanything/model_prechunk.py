@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
-from mapanything.models.mapanything.mv_compression import MultiScaleViewCompressionUNet
+from mapanything.models.mapanything.mv_compression import MultiViewToEmbedding
 from mapanything.utils.geometry import (
     apply_log_to_norm,
     convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap,
@@ -235,7 +235,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
                 first_global = self.chunk_layer_threshold + 1
             num_global_layers_in_merged = ((depth - first_global) // 2) + 1
             self.view_compressions = nn.ModuleList([
-                MultiScaleViewCompressionUNet(**self.view_compression_config)
+                MultiViewToEmbedding(**self.view_compression_config)
                 for _ in range(num_global_layers_in_merged)
             ])
         else:
