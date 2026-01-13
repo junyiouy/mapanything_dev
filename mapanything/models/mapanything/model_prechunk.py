@@ -1580,7 +1580,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         batch_size_per_view, _, height, width = views[0]["img"].shape
         img_shape = (int(height), int(width))
         num_views = len(views)
-        num_chunks = num_views // 2
+        num_chunks = num_views 
 
         # 验证输入约束
         assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"
