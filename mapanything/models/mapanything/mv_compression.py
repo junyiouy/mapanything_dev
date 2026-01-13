@@ -9,7 +9,9 @@ class ViewPooling(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         
-        self.norm = nn.LayerNorm(dim)
+        self.proj_in = nn.Linear(dim,dim)
+        self.logit_scale = nn.Parameter(torch.ones([]) * 2.659 / 2)
+
         if mode == 'attn':
             self.q_proj = nn.Linear(dim, dim)
             self.k_proj = nn.Linear(dim, dim)
@@ -23,10 +25,14 @@ class ViewPooling(nn.Module):
         B = Bk // k
         
         x = x.view(B, k, C) # (B, k, C)
-        x = self.norm(x)
+        x = self.proj_in(x)
         
         if self.mode == 'mean':
-            return x.mean(dim=1, keepdim=True) # (B, 1, C)
+            x_mean = x.mean(dim=1, keepdim=True)
+            x_mean_norm = torch.nn.functional.normalize(x_mean, dim=-1)
+            logit_scale = self.logit_scale.exp().clamp(max=100, min=1e-4)
+            return logit_scale * x_mean_norm  # (B, 1, C)
+
         
         elif self.mode == 'attn':
             # q: (B, 1, C), k/v: (B, k, C)
@@ -40,13 +46,16 @@ class ViewPooling(nn.Module):
                 q.unsqueeze(1), k_f.unsqueeze(1), v_f.unsqueeze(1)
             ).squeeze(1) # (B, 1, C)
             
-            return self.out_proj(attn_out)
+            attn_out = self.out_proj(attn_out)  # (B, 1, C)
+            attn_out_norm = torch.nn.functional.normalize(attn_out, dim=-1)
+            logit_scale = self.logit_scale.exp().clamp(max=100, min=1e-4)
+            return logit_scale * attn_out_norm  # (B, 1, C)
 
 class ConvResidualBlock(nn.Module):
     def __init__(self, in_d, out_d, zero_init=False):
         super().__init__()
         self.conv = nn.Conv2d(in_d, out_d, kernel_size=3, padding=1, bias=False)
-        self.norm = nn.GroupNorm(out_d//64, out_d) 
+        self.norm = nn.GroupNorm(1, out_d) 
         self.act = nn.GELU()
         self.proj = nn.Conv2d(in_d, out_d, 1) if in_d != out_d else nn.Identity()
         
@@ -67,7 +76,6 @@ class MultiViewToEmbedding(nn.Module):
         self.enc1 = ConvResidualBlock(dim, dim)
         self.enc2 = ConvResidualBlock(dim, dim)
 
-        
         # 4. 视角聚合 (View Pooling)
         self.view_aggregation = ViewPooling(pool_mode, dim, num_heads)
 
@@ -83,3 +91,76 @@ class MultiViewToEmbedding(nn.Module):
         embedding = self.view_aggregation(x, k) # (B, 1, dim)
         
         return embedding
+
+
+class LayerBudgetController(nn.Module):
+    def __init__(self, num_chunk_layers):
+        super().__init__()
+        self.num_chunk_layers = num_chunk_layers
+        
+        # 可学习参数：每一层争夺"剩余预算"的权重，什么初始化合理，能给softmax合适的分布？
+        self.layer_logits = nn.Parameter(torch.ones(num_chunk_layers) * 10.0)
+
+
+    def forward(self, total_budget):
+        """
+        Args:
+            total_budget (float or tensor): 总预算数量
+        """
+        # --- 1. 预处理总预算 ---
+        if isinstance(total_budget, torch.Tensor):
+            budget_val = total_budget.float() # 保持梯度图（虽然通常它是常数）
+        else:
+            budget_val = torch.tensor(float(total_budget), device=self.layer_logits.device)
+
+        # 确保总预算至少能覆盖每层 1 个 (Base Constraint)
+        # 使用 clamp 替代 if-else，代码更简洁且兼容 Tensor 操作
+        effective_total_budget = torch.max(
+            budget_val, 
+            torch.tensor(float(self.num_chunk_layers), device=budget_val.device)
+        )
+
+        # --- 2. 计算剩余预算 (Residual Budget) ---
+        # 既然每层至少要 1，那就先扣除掉必须的
+        residual_budget = effective_total_budget - self.num_chunk_layers
+        
+        # --- 3. 计算连续分配 (Continuous Allocation) ---
+        probs = F.softmax(self.layer_logits, dim=0)
+        
+        # 理想的浮点数分配结果 (Float)
+        # 例如: [2.5, 3.5, 1.0] -> 剩余预算分配
+        allocated_residual_float = probs * residual_budget
+        
+        # --- 4. 关键修改：CumSum Trick 保证整数和守恒 ---
+        # 技巧：对 PDF 做累积求和变成 CDF -> 对 CDF 取整 -> 做差分还原 PDF
+        # 这能保证 sum(integer_parts) === round(sum(float_parts))
+        
+        # a. 累积求和
+        cum_alloc = torch.cumsum(allocated_residual_float, dim=0)
+        
+        # b. 最后一个元素强制等于 residual_budget，消除累积浮点误差
+        # (虽然 cumsum 后最后一个值理论上就是 residual_budget，但为了数值稳定强行赋值)
+        cum_alloc_target = cum_alloc.clone()
+        cum_alloc_target[-1] = residual_budget
+        
+        # c. 对累积值取整
+        cum_alloc_rounded = torch.round(cum_alloc_target)
+        
+        # d. 差分还原 (第 i 个 = cum[i] - cum[i-1])
+        # 补一个 0 在最前面方便做差分
+        padded_cum = torch.cat([
+            torch.zeros(1, device=cum_alloc.device), 
+            cum_alloc_rounded
+        ])
+        allocated_residual_int = padded_cum[1:] - padded_cum[:-1]
+        
+        # --- 5. STE (Straight-Through Estimator) ---
+        # 前向传播用整数 (int)，反向传播传给浮点 (float)
+        # y = x_float + (x_int - x_float).detach()
+        allocated_residual_ste = allocated_residual_float + (allocated_residual_int - allocated_residual_float).detach()
+        
+        # --- 6. 加上 Base 1 ---
+        # 最终预算 = 基础预算(1) + 剩余分配(>=0)
+        final_budgets = 1.0 + allocated_residual_ste
+        
+        return final_budgets

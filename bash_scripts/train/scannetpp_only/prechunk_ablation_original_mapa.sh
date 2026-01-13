@@ -8,13 +8,13 @@
 NUM_GPUS=$1
 
 
-torchrun --nproc_per_node ${NUM_GPUS} --master_port 29594 \
+torchrun --nproc_per_node ${NUM_GPUS} --master_port 29598 \
     scripts/train.py \
     machine=dgx02 \
     dataset=mine_scannetpp_only dataset.num_workers=12 \
     dataset.num_views=24 \
     loss=overall_pairwise_loss_weigh_pm_higher_point_lower \
-    model=mapanything_prechunk_fusion_2_mean_pool \
+    model=mapanything \
     model/task=aug_training \
     model.encoder.gradient_checkpointing=true \
     model.pred_head.gradient_checkpointing=true \
@@ -24,10 +24,9 @@ torchrun --nproc_per_node ${NUM_GPUS} --master_port 29594 \
     train_params.resume=true \
     train_params.warmup_epochs=2 \
     train_params.keep_freq=20 \
-    train_params.eval_freq=2 \
     train_params.max_num_of_imgs_per_gpu=24 \
     train_params.accum_iter=4 \
-    hydra.run.dir='${root_experiments_dir}/mapanything/training/prechunk_pre_2_layers_topk_2_ste' \
+    hydra.run.dir='${root_experiments_dir}/mapanything/training/prechunk_ablation_original_mapa' \
     model.pretrained='/wekafs/ict/junyiouy/map-anything/checkpoints/facebook_map-anything.pth' 
 
-# 这一版有bug，重复使用了chunk layer threshold前面的层
+# 这个在上一个的基础上把kv的归一化加上，并且全量训练

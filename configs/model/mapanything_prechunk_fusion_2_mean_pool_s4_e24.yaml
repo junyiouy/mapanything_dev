@@ -1,0 +1,27 @@
+defaults:
+  - default
+  - encoder: dinov2_large
+  - info_sharing: aat_ifr_24_layers
+  - pred_head: dpt_pose_scale
+  - task: images_only
+
+# String for model factory
+model_str: "mapanything_prechunk"
+# Model config
+model_config:
+  name: "mapanything_prechunk"
+  encoder_config: ${model.encoder}
+  info_sharing_config: ${model.info_sharing}
+  pred_head_config: ${model.pred_head}
+  geometric_input_config: ${model.task}
+  view_compression_config:
+    dim: 768
+    pool_mode: "mean"
+    num_heads: 12
+  use_view_compression: True
+  chunk_layer_threshold: 2
+  chunk_start_layer: 2
+  chunk_end_layer: 24
+  # pretrained_checkpoint_path: /wekafs/ict/junyiouy/map-anything/checkpoints/facebook_map-anything.pth
+# Image Normalization Type
+data_norm_type: ${model.encoder.data_norm_type}

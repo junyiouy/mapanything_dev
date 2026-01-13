@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
-from mapanything.models.mapanything.mv_compression import MultiViewToEmbedding
+from mapanything.models.mapanything.mv_compression import MultiViewToEmbedding, LayerBudgetController
 from mapanything.utils.geometry import (
     apply_log_to_norm,
     convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap,
@@ -109,6 +109,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         use_view_compression: bool = False,
         view_compression_config: Dict = None,
         chunk_layer_threshold: int = 16,
+        chunk_start_layer: int = 16,
+        chunk_end_layer: int = None,
     ):
         """
         Multi-view model containing an image encoder fused with optional geometric modalities followed by a multi-view attention transformer and respective downstream heads.
@@ -148,6 +150,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         self.use_view_compression = use_view_compression
         self.view_compression_config = view_compression_config
         self.chunk_layer_threshold = chunk_layer_threshold
+        self.chunk_start_layer = chunk_start_layer
+        self.chunk_end_layer = chunk_end_layer
         self.class_init_args = {
             "name": self.name,
             "encoder_config": self.encoder_config,
@@ -163,6 +167,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             "use_view_compression": self.use_view_compression,
             "view_compression_config": self.view_compression_config,
             "chunk_layer_threshold": self.chunk_layer_threshold,
+            "chunk_start_layer": self.chunk_start_layer,
+            "chunk_end_layer": self.chunk_end_layer,
         }
 
         # Get relevant parameters from the configs
@@ -223,21 +229,23 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         self.scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim))
         torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
 
-        # Initialize view compression modules if required
         if self.use_view_compression:
-            # Calculate number of global attention layers in merged phase
-            # Global attention layers are at depth_idx % 2 == 0
-            # Starting from chunk_layer_threshold
-            depth = info_sharing_config["module_args"]["depth"]
-            if self.chunk_layer_threshold % 2 == 0:
-                first_global = self.chunk_layer_threshold
-            else:
-                first_global = self.chunk_layer_threshold + 1
-            num_global_layers_in_merged = ((depth - first_global) // 2) + 1
+            # 模拟 forward 里的循环，找出所有会执行全局注意力的索引
+            global_indices = [
+                i for i in range(self.chunk_start_layer, info_sharing_config["module_args"]["depth"] if chunk_end_layer is None else chunk_end_layer)
+                if i % 2 == 0
+            ]
+            
+            num_global_layers_in_merged = len(global_indices)
+            
             self.view_compressions = nn.ModuleList([
                 MultiViewToEmbedding(**self.view_compression_config)
                 for _ in range(num_global_layers_in_merged)
             ])
+
+            self.layer_budget_controller = LayerBudgetController(
+                num_chunk_layers=num_global_layers_in_merged,
+            )
         else:
             self.view_compressions = None
 
@@ -1658,6 +1666,8 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             height=chunked_states[0].height,
             width=chunked_states[0].width,
         )
+        # get layer budget
+        layer_budgets = self.layer_budget_controller((num_chunks * len(self.view_compressions)) / 2)
 
         # Step 4: Merged phase - 将所有chunks合并处理剩余的transformer层
         final_info_sharing_multi_view_feat, merged_intermediate_multi_view_features = self.info_sharing(
@@ -1666,6 +1676,9 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             chunk_layer_threshold=self.chunk_layer_threshold,
             view_compressions=self.view_compressions,
             num_chunks=num_chunks,
+            layer_budgets=layer_budgets,
+            chunk_start_layer=self.chunk_start_layer,
+            chunk_end_layer=self.chunk_end_layer,
         )
 
         # collect premerge_intermediate_feature
@@ -1692,8 +1705,6 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             all_encoder_features_across_views.extend(
                 all_chunk_encoder_features_across_views[chunk_idx]
             )
-
-
 
         if self.pred_head_type == "linear":
             # Stack the features for all views
