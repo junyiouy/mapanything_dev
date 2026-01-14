@@ -223,17 +223,15 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         self.scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim))
         torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
 
-        # Initialize view compression modules if required
         if self.use_view_compression:
-            # Calculate number of global attention layers in merged phase
-            # Global attention layers are at depth_idx % 2 == 0
-            # Starting from chunk_layer_threshold
-            depth = info_sharing_config["module_args"]["depth"]
-            if self.chunk_layer_threshold % 2 == 0:
-                first_global = self.chunk_layer_threshold
-            else:
-                first_global = self.chunk_layer_threshold + 1
-            num_global_layers_in_merged = ((depth - first_global) // 2) + 1
+            # 模拟 forward 里的循环，找出所有会执行全局注意力的索引
+            global_indices = [
+                i for i in range(self.chunk_layer_threshold, info_sharing_config["module_args"]["depth"])
+                if i % 2 == 0
+            ]
+            
+            num_global_layers_in_merged = len(global_indices)
+            
             self.view_compressions = nn.ModuleList([
                 MultiViewToEmbedding(**self.view_compression_config)
                 for _ in range(num_global_layers_in_merged)
@@ -1572,7 +1570,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
         batch_size_per_view, _, height, width = views[0]["img"].shape
         img_shape = (int(height), int(width))
         num_views = len(views)
-        num_chunks = num_views // 2
+        num_chunks = num_views 
 
         # 验证输入约束
         assert num_views % num_chunks == 0, f"num_views ({num_views}) must be divisible by num_chunks ({num_chunks})"

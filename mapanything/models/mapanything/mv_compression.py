@@ -10,6 +10,7 @@ class ViewPooling(nn.Module):
         self.num_heads = num_heads
         
         self.norm = nn.LayerNorm(dim)
+        self.output_norm = nn.LayerNorm(dim)
         if mode == 'attn':
             self.q_proj = nn.Linear(dim, dim)
             self.k_proj = nn.Linear(dim, dim)
@@ -23,14 +24,15 @@ class ViewPooling(nn.Module):
         B = Bk // k
         
         x = x.view(B, k, C) # (B, k, C)
-        x = self.norm(x)
+        
         
         if self.mode == 'mean':
-            return x.mean(dim=1, keepdim=True) # (B, 1, C)
+            return self.output_norm(x.mean(dim=1, keepdim=True)) # (B, 1, C)
         
         elif self.mode == 'attn':
             # q: (B, 1, C), k/v: (B, k, C)
             q = self.q_proj(self.query_token.expand(B, -1, -1))
+            x = self.norm(x)
             k_f = self.k_proj(x)
             v_f = self.v_proj(x)
             
@@ -40,13 +42,13 @@ class ViewPooling(nn.Module):
                 q.unsqueeze(1), k_f.unsqueeze(1), v_f.unsqueeze(1)
             ).squeeze(1) # (B, 1, C)
             
-            return self.out_proj(attn_out)
+            return self.output_norm(self.out_proj(attn_out))
 
 class ConvResidualBlock(nn.Module):
     def __init__(self, in_d, out_d, zero_init=False):
         super().__init__()
         self.conv = nn.Conv2d(in_d, out_d, kernel_size=3, padding=1, bias=False)
-        self.norm = nn.GroupNorm(out_d//64, out_d) 
+        self.norm = nn.GroupNorm(1, out_d) 
         self.act = nn.GELU()
         self.proj = nn.Conv2d(in_d, out_d, 1) if in_d != out_d else nn.Identity()
         
