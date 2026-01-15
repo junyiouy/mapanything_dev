@@ -11,6 +11,7 @@ class ViewPooling(nn.Module):
         
         self.norm = nn.LayerNorm(dim)
         self.output_norm = nn.LayerNorm(dim)
+        self.linear = nn.Linear(dim, dim)
         if mode == 'attn':
             self.q_proj = nn.Linear(dim, dim)
             self.k_proj = nn.Linear(dim, dim)
@@ -27,6 +28,7 @@ class ViewPooling(nn.Module):
         
         
         if self.mode == 'mean':
+            x = self.linear(self.norm(x)) # (B, k, C)
             return self.output_norm(x.mean(dim=1, keepdim=True)) # (B, 1, C)
         
         elif self.mode == 'attn':
