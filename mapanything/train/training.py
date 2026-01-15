@@ -676,7 +676,7 @@ def train_one_epoch(
             optimizer,
             parameters=model.parameters(),
             update_grad=(data_iter_step + 1) % accum_iter == 0,
-            clip_grad=1.0,
+            clip_grad=10.0,
         )
 
         # Zero out the gradients to prepare for the next iteration of gradient descent
