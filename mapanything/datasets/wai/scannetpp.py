@@ -107,17 +107,17 @@ class ScanNetPPWAI(BaseDataset):
         )
         pairwise_covisibility = load_data(covisibility_map_path, "mmap")
 
-        # # Get the indices of the N views in the scene
-        # view_indices = self._sample_view_indices(
-        #     num_views_to_sample, num_views_in_scene, pairwise_covisibility
-        # )
+        # Get the indices of the N views in the scene
+        view_indices = self._sample_view_indices(
+            num_views_to_sample, num_views_in_scene, pairwise_covisibility
+        )
 
-        # NOTE: For ScanNetPP, we sample views with random intervals from 1 to min(20, num_views_in_scene//num_views_to_sample)
-        max_interval = min(20, num_views_in_scene // num_views_to_sample)
-        interval = np.random.randint(1, max_interval + 1)
-        start_idx = np.random.randint(0, max(1, num_views_in_scene - interval * num_views_to_sample + 1))
-        view_indices = [start_idx + i * interval for i in range(num_views_to_sample)]
-        view_indices = [idx % num_views_in_scene for idx in view_indices]
+        # # NOTE: For ScanNetPP, we sample views with random intervals from 1 to min(20, num_views_in_scene//num_views_to_sample)
+        # max_interval = min(20, num_views_in_scene // num_views_to_sample)
+        # interval = np.random.randint(1, max_interval + 1)
+        # start_idx = np.random.randint(0, max(1, num_views_in_scene - interval * num_views_to_sample + 1))
+        # view_indices = [start_idx + i * interval for i in range(num_views_to_sample)]
+        # view_indices = [idx % num_views_in_scene for idx in view_indices]
 
         # Get the views corresponding to the selected view indices
         views = []

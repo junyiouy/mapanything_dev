@@ -1,0 +1,9 @@
+original_root: /wekafs/ict/junyiouy/arkitscenes_processed
+root: /wekafs/ict/junyiouy/map_anything_data/arkitscene
+
+dataset_name: arkitscenes
+version: 0.1
+overwrite: True
+
+scene_filters:
+  - process_state_not: [conversion, finished]

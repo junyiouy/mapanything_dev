@@ -28,6 +28,11 @@ from safetensors.torch import load_file as load_sft, save_file as save_sft
 from torchvision.io import decode_image
 from yaml import CLoader
 
+
+# import OpenEXR
+# import Imath
+
+
 from mapanything.utils.wai.ops import (
     to_numpy,
 )
@@ -265,7 +270,7 @@ def _read_exr(
     fname: str | Path, fmt: Literal["np", "PIL", "torch"] = "torch", **kwargs
 ) -> np.ndarray | torch.Tensor | Image.Image:
     """
-    Reads an EXR image file using OpenCV.
+    Reads an EXR image file using OpenEXR (preferred) or OpenCV as fallback.
 
     Args:
         fname (str or Path): The filename of the EXR image to read.
@@ -284,10 +289,37 @@ def _read_exr(
 
     Notes:
         The EXR image is read in its original format, without any conversion or rescaling.
+        OpenEXR is used for better handling of multi-channel EXR files and efficiency.
     """
     data = cv2.imread(str(fname), cv2.IMREAD_UNCHANGED)
     if data is None:
         raise FileNotFoundError(f"Failed to read EXR file: {fname}")
+    
+    # file = OpenEXR.InputFile(str(fname))
+    # dw = file.header()['dataWindow']
+    # size = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
+    # channels = file.header()['channels']
+    # pt = Imath.PixelType(Imath.PixelType.FLOAT)
+    # if 'R' in channels and 'G' in channels and 'B' in channels:
+    #     # RGB channels
+    #     R = file.channel('R', pt)
+    #     G = file.channel('G', pt)
+    #     B = file.channel('B', pt)
+    #     r = np.frombuffer(R, dtype=np.float32).reshape(size[1], size[0])
+    #     g = np.frombuffer(G, dtype=np.float32).reshape(size[1], size[0])
+    #     b = np.frombuffer(B, dtype=np.float32).reshape(size[1], size[0])
+    #     data = np.stack([r, g, b], axis=-1)
+    # elif 'Z' in channels:
+    #     # Depth channel
+    #     Z = file.channel('Z', pt)
+    #     data = np.frombuffer(Z, dtype=np.float32).reshape(size[1], size[0])
+    # else:
+    #     # Fallback to first available channel
+    #     ch_name = list(channels.keys())[0]
+    #     ch = file.channel(ch_name, pt)
+    #     data = np.frombuffer(ch, dtype=np.float32).reshape(size[1], size[0])
+    # data = np.array(data, dtype=np.float32)
+
     if fmt == "torch":
         # Convert to PyTorch tensor with float32 dtype
         data = torch.from_numpy(data).float()
@@ -1376,3 +1408,18 @@ def _get_method(
         return methods[format_type][0 if load else 1]
     except KeyError as e:
         raise NotImplementedError(f"Format not supported: {format_type}") from e
+
+if __name__ == "__main__":
+    # 使用/wekafs/ict/junyiouy/map_anything_data/spatialvid/group_0006/0a6c49ec-c24e-5d66-9595-c412da6d0e2b/depth/00004.exr测试加载深度图
+    # depth_path = "/wekafs/ict/junyiouy/map_anything_data/spatialvid/group_0006/0a6c49ec-c24e-5d66-9595-c412da6d0e2b/depth/00004.exr"
+    depth_path = "/wekafs/ict/junyiouy/map_anything_data/scannetppv2/0a76e06478/rendered_depth/DSC03567.exr"
+
+    # 加载深度图
+    data = _load_depth(depth_path, fmt="torch")
+    print(data.shape, data.dtype, torch.min(data), torch.max(data))
+
+    # 使用opencv unchanged模式加载exr深度图
+    # data = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    # print(data.shape, data.dtype, np.min(data), np.max(data))
+
+

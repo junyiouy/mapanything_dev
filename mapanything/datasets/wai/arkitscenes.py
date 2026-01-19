@@ -4,10 +4,11 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 """
-ETH3D Dataset using WAI format data.
+ARKitScenes Dataset using WAI format data.
 """
 
 import os
+from pathlib import Path
 
 import numpy as np
 
@@ -15,9 +16,9 @@ from mapanything.datasets.base.base_dataset import BaseDataset
 from mapanything.utils.wai.core import load_data, load_frame
 
 
-class ETH3DWAI(BaseDataset):
+class ARKitScenesWAI(BaseDataset):
     """
-    ETH3D dataset containing high-quality outdoor and indoor scans of the ETH Zurich campus.
+    ARKitScenes dataset containing diverse indoor scenes.
     """
 
     def __init__(
@@ -25,6 +26,7 @@ class ETH3DWAI(BaseDataset):
         *args,
         ROOT,
         dataset_metadata_dir,
+        split,
         overfit_num_sets=None,
         sample_specific_scene: bool = False,
         specific_scene_name: str = None,
@@ -35,6 +37,7 @@ class ETH3DWAI(BaseDataset):
         Args:
             ROOT: Root directory of the dataset.
             dataset_metadata_dir: Path to the dataset metadata directory.
+            split: Dataset split (train, val, test).
             overfit_num_sets: If None, use all sets. Else, the dataset will be truncated to this number of sets.
             sample_specific_scene: Whether to sample a specific scene from the dataset.
             specific_scene_name: Name of the specific scene to sample.
@@ -43,7 +46,7 @@ class ETH3DWAI(BaseDataset):
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.dataset_metadata_dir = dataset_metadata_dir
-        self.split = "test"
+        self.split = split
         self.overfit_num_sets = overfit_num_sets
         self.sample_specific_scene = sample_specific_scene
         self.specific_scene_name = specific_scene_name
@@ -55,19 +58,67 @@ class ETH3DWAI(BaseDataset):
 
     def _load_data(self):
         "Load the precomputed dataset metadata"
-        # Load the dataset metadata corresponding to the split
-        split_metadata_path = os.path.join(
-            self.dataset_metadata_dir,
-            self.split,
-            f"eth3d_scene_list_{self.split}.npy",
-        )
-        split_scene_list = np.load(split_metadata_path, allow_pickle=True)
+        cache_path = os.path.join(self.ROOT, "arkitscenes_splits.npy")
 
-        # Get the list of all scenes
-        if not self.sample_specific_scene:
-            self.scenes = list(split_scene_list)
-        else:
-            self.scenes = [self.specific_scene_name]
+        # Try to load splits from cache first
+        splits = None
+        if os.path.exists(cache_path):
+            try:
+                splits = np.load(cache_path, allow_pickle=True).item()
+                print(f"Loaded splits from cache: {cache_path}")
+            except Exception as e:
+                print(f"Failed to load cache {cache_path}: {e}, will regenerate...")
+                splits = None
+
+        # If cache doesn't exist or failed to load, traverse directory and create splits
+        if splits is None:
+            print("Generating scene list and splits by traversing directory...")
+            all_scenes = []
+            training_dir = Path(self.ROOT) / "Training"
+            if training_dir.exists():
+                for scene_dir in training_dir.iterdir():
+                    if scene_dir.is_dir():
+                        scene_meta_path = scene_dir / "scene_meta.json"
+                        if scene_meta_path.exists():
+                            scene_name = f"Training/{scene_dir.name}"
+                            all_scenes.append(scene_name)
+
+            # Shuffle and split: 80% train, 10% val, 10% test
+            np.random.seed(42)  # For reproducibility
+            np.random.shuffle(all_scenes)
+            n_total = len(all_scenes)
+            n_train = int(0.8 * n_total)
+            n_val = int(0.1 * n_total)
+            n_test = n_total - n_train - n_val
+
+            splits = {
+                'train': all_scenes[:n_train],
+                'val': all_scenes[n_train:n_train + n_val],
+                'test': all_scenes[n_train + n_val:]
+            }
+
+            # Save cache for future use
+            try:
+                np.save(cache_path, splits)
+                print(f"Saved splits cache to: {cache_path}")
+                print(f"Train: {len(splits['train'])}, Val: {len(splits['val'])}, Test: {len(splits['test'])}")
+            except Exception as e:
+                print(f"Failed to save cache {cache_path}: {e}")
+
+        # Select scenes based on split
+        self.scenes = splits.get(self.split, [])
+        if not self.scenes:
+            print(f"Warning: No scenes found for split '{self.split}'")
+
+        if self.sample_specific_scene:
+            self.scenes = [self.specific_scene_name] if self.specific_scene_name in self.scenes else []
+
+        if self.overfit_num_sets is not None:
+            original_len = len(self.scenes)
+            self.scenes = self.scenes[: self.overfit_num_sets]
+            self.scenes = self.scenes * (original_len // self.overfit_num_sets)
+            print(f"Overfitting to {self.overfit_num_sets} sets. Total scenes used: {len(self.scenes)}")
+
         self.num_of_scenes = len(self.scenes)
 
     def _get_views(self, sampled_idx, num_views_to_sample, resolution):
@@ -80,36 +131,25 @@ class ETH3DWAI(BaseDataset):
         scene_meta = load_data(
             os.path.join(scene_root, "scene_meta.json"), "scene_meta"
         )
-        scene_file_names = list(scene_meta["frame_names"].keys())
-        num_views_in_scene = len(scene_file_names)
+        frames = scene_meta["frames"]
+        num_views_in_scene = len(frames)
 
-        # Load the scene pairwise covisibility mmap
-        covisibility_version_key = "v0"
-        covisibility_map_dir = os.path.join(
-            scene_root, "covisibility", covisibility_version_key
-        )
-        # Assumes only npy file in directory is covisbility map
-        covisibility_map_name = next(
-            f for f in os.listdir(covisibility_map_dir) if f.endswith(".npy")
-        )
-        covisibility_map_path = os.path.join(
-            scene_root, "covisibility", covisibility_version_key, covisibility_map_name
-        )
-        pairwise_covisibility = load_data(covisibility_map_path, "mmap")
-
-        # Get the indices of the N views in the scene
-        view_indices = self._sample_view_indices(
-            num_views_to_sample, num_views_in_scene, pairwise_covisibility
-        )
+        # Sample views with random intervals, similar to ScanNetPP (no covisibility needed)
+        max_interval = min(20, num_views_in_scene // num_views_to_sample)
+        interval = np.random.randint(1, max_interval + 1)
+        start_idx = np.random.randint(0, max(1, num_views_in_scene - interval * num_views_to_sample + 1))
+        view_indices = [start_idx + i * interval for i in range(num_views_to_sample)]
+        view_indices = [idx % num_views_in_scene for idx in view_indices]
 
         # Get the views corresponding to the selected view indices
         views = []
         for view_index in view_indices:
+            frame_data = frames[view_index]
+
             # Load the data corresponding to the view
-            view_file_name = scene_file_names[view_index]
             view_data = load_frame(
                 scene_root,
-                view_file_name,
+                frame_data["frame_name"],
                 modalities=["image", "depth"],
                 scene_meta=scene_meta,
             )
@@ -120,6 +160,9 @@ class ETH3DWAI(BaseDataset):
             depthmap = view_data["depth"].numpy().astype(np.float32)
             intrinsics = view_data["intrinsics"].numpy().astype(np.float32)
             c2w_pose = view_data["extrinsics"].numpy().astype(np.float32)
+
+            # Ensure that the depthmap has all valid values
+            depthmap = np.nan_to_num(depthmap, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Resize the data to match the desired resolution
             image, depthmap, intrinsics = self._crop_resize_if_necessary(
@@ -137,9 +180,9 @@ class ETH3DWAI(BaseDataset):
                     depthmap=depthmap,
                     camera_pose=c2w_pose,  # cam2world
                     camera_intrinsics=intrinsics,
-                    dataset="ETH3D",
+                    dataset="ARKitScenes",
                     label=scene_name,
-                    instance=os.path.join("images", str(view_file_name)),
+                    instance=os.path.join("images", str(frame_data["frame_name"])),
                 )
             )
 
@@ -150,7 +193,9 @@ def get_parser():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-rd", "--root_dir", default="/wekafs/ict/junyiouy/map_anything_data/eth3d", type=str)
+    parser.add_argument(
+        "-rd", "--root_dir", default="/wekafs/ict/junyiouy/map_anything_data/arkitscene", type=str
+    )
     parser.add_argument(
         "-dmd",
         "--dataset_metadata_dir",
@@ -182,24 +227,25 @@ if __name__ == "__main__":
     )  # Options: --headless, --connect, --serve, --addr, --save, --stdout
     args = parser.parse_args()
 
-    dataset = ETH3DWAI(
+    dataset = ARKitScenesWAI(
         num_views=args.num_of_views,
-        covisibility_thres=0.025,
+        split="train",
+        covisibility_thres=0.25,
         ROOT=args.root_dir,
         dataset_metadata_dir=args.dataset_metadata_dir,
         resolution=(518, 336),
-        seed=777,
-        transform="imgnorm",
+        aug_crop=16,
+        transform="colorjitter+grayscale+gaublur",
         data_norm_type="dinov2",
     )
     print(dataset.get_stats())
 
     if args.viz:
-        rr.script_setup(args, "ETH3D_Dataloader")
+        rr.script_setup(args, "ARKitScenes_Dataloader")
         rr.set_time("stable_time", sequence=0)
         rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
-    sampled_indices = np.random.choice(len(dataset), size=len(dataset), replace=False)
+    sampled_indices = np.random.choice(len(dataset), size=10, replace=False)
 
     for num, idx in enumerate(tqdm(sampled_indices)):
         views = dataset[idx]

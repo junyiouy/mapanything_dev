@@ -1,0 +1,15 @@
+original_root: /wekafs/ict/junyiouy/aea_dataset/processed_aea  # 您的原始数据集路径
+root: /wekafs/ict/junyiouy/map_anything_data/aea           # WAI格式输出路径
+
+
+dataset_name: aea  # 给您的数据集起个名字
+version: 0.1
+modalities: [dslr]
+overwrite: True
+
+scene_filters:
+  - process_state_not: [conversion, finished]
+
+# 可选：并行处理配置
+num_workers: 4  # 并行worker数量
+front_num: 1    # 第一个场景单独处理用于调试

@@ -1,0 +1,17 @@
+stage: conversion
+root: /wekafs/ict/junyiouy/map_anything_data/arkitscene
+
+gpus: 0
+cpus: 10
+mem: 20
+scenes_per_job: 20
+conda_env: # pass the name of our conda environment
+nodelist:
+
+num_workers: 16
+
+stages:
+  conversion:
+    script: conversion/arkitscenes.py
+    config: conversion/arkitscenes.yaml
+    scenes_per_job: 50
