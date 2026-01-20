@@ -37,8 +37,8 @@ for combo in "${batch_sizes_and_views[@]}"; do
         model=mapanything_prechunk_fusion_2_mean_pool_s2_e24 \
         model/task=images_only \
         model.encoder.uses_torch_hub=false \
-        model.pretrained='/wekafs/ict/junyiouy/map-anything/experiments/mapanything/training/prechunk_pre_2_layers_topk_half_mod/checkpoint-best.pth' \
-        hydra.run.dir='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_mod'
+        model.pretrained='/wekafs/ict/junyiouy/map-anything/experiments/mapanything/training/prechunk_pre_2_layers_topk_half_layer_ste3_lr/checkpoint-last.pth' \
+        hydra.run.dir='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_ste3_lr'
 
     echo "Finished running $dataset with batch_size=$batch_size and num_views=$num_views"
 done

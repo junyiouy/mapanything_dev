@@ -5247,3 +5247,59 @@ class DisentangledFactoredGeometryScaleRegr3DPlusNormalGMLoss(
         losses = Sum(*loss_terms)
 
         return losses, (details | {})
+
+class DiversityLoss(MultiLoss):
+    """
+    Diversity Loss to encourage orthogonality among chunk embeddings.
+    Formula: L = || E @ E.T - I ||_F^2
+    Also logs LayerBudgetController probabilities if available.
+    """
+    def __init__(self, weight=0.1):
+        super().__init__()
+        self._alpha = weight
+
+    def get_name(self):
+        return "DiversityLoss"
+
+    def compute_loss(self, batch, preds, **kw):
+        # preds is a list of dicts. The first one should have 'chunk_embeddings'
+        # Check if chunk_embeddings exists
+        if not preds:
+             device = batch[0]["img"].device if batch else torch.device("cpu")
+             return torch.tensor(0.0, device=device, requires_grad=True), {}
+
+        details = {}
+        total_loss = 0.0
+        
+        # 1. Compute Diversity Loss
+        if "chunk_embeddings" in preds[0]:
+            chunk_embeddings_layers = preds[0]["chunk_embeddings"]
+            count = 0
+            for i, embeddings in enumerate(chunk_embeddings_layers):
+                if embeddings is None: continue
+                
+                B, N, C = embeddings.shape
+                embeddings = torch.nn.functional.normalize(embeddings, dim=-1)
+                gram_matrix = torch.matmul(embeddings, embeddings.transpose(1, 2))
+                identity = torch.eye(N, device=embeddings.device).unsqueeze(0).expand(B, N, N)
+                diff = gram_matrix - identity
+                layer_loss = (diff ** 2).sum(dim=(1, 2)).mean()
+                layer_loss = layer_loss / (N * N)
+                
+                total_loss = total_loss + layer_loss
+                details[f"diversity_loss_layer_{i}"] = float(layer_loss)
+                count += 1
+
+            if count > 0:
+                total_loss = total_loss / count
+        else:
+             device = batch[0]["img"].device if batch else torch.device("cpu")
+             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        # 2. Log Budget Probabilities (if available)
+        if "layer_budget_probs" in preds[0]:
+            probs = preds[0]["layer_budget_probs"] # Tensor (num_layers,)
+            for idx, p in enumerate(probs):
+                details[f"budget_prob_layer_{idx}"] = float(p)
+        
+        return total_loss, details

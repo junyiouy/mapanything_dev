@@ -1,5 +1,4 @@
 #!/bin/bash
-#!/bin/bash
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
@@ -34,11 +33,11 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset.num_workers=12 \
         dataset.num_views=$num_views \
         batch_size=$batch_size \
-        model=mapanything_prechunk_fusion_2_mean_pool_s2_e24 \
+        model=mapanything \
         model/task=images_only \
         model.encoder.uses_torch_hub=false \
-        model.pretrained='/wekafs/ict/junyiouy/map-anything/experiments/mapanything/training/prechunk_pre_2_layers_topk_half_mod/checkpoint-best.pth' \
-        hydra.run.dir='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_mod'
+        model.pretrained='/wekafs/ict/junyiouy/map-anything/experiments/mapanything/training/prechunk_ablation_original_mapa/checkpoint-last.pth' \
+        hydra.run.dir='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_24v_trained'
 
     echo "Finished running $dataset with batch_size=$batch_size and num_views=$num_views"
 done

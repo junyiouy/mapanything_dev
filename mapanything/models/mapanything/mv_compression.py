@@ -75,6 +75,14 @@ class MultiViewToEmbedding(nn.Module):
         
         self.enc1 = ConvResidualBlock(dim, dim)
         self.enc2 = ConvResidualBlock(dim, dim)
+        
+        # Projection Head (MLP) for better representation space
+        # Input dim * 2 because of Mean + Max concat
+        self.proj_head = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim)
+        )
 
         # 4. 视角聚合 (View Pooling)
         self.view_aggregation = ViewPooling(pool_mode, dim, num_heads)
@@ -83,8 +91,16 @@ class MultiViewToEmbedding(nn.Module):
         # x: (B*k, C, H, W)
 
         x = self.enc1(x)  # (B*k, C, H, W)
-        x = self.enc2(x)  # (B*k, C, H, W
-        x = x.mean(dim=[2,3])  # 全局平均池化，得到 (B*k, C)        
+        x = self.enc2(x)  # (B*k, C, H, W)
+        
+        # Mixed Pooling: Mean + Max
+        # Preserves both global context and salient features
+        x_mean = x.mean(dim=[2, 3]) # (B*k, C)
+        x_max = x.amax(dim=[2, 3])  # (B*k, C)
+        x = torch.cat([x_mean, x_max], dim=-1) # (B*k, 2C)
+        
+        # Projection
+        x = self.proj_head(x) # (B*k, C)
         
         # --- 视角聚合 ---
         # 核心：将 B*k 个向量聚合为 B 个向量
@@ -94,12 +110,13 @@ class MultiViewToEmbedding(nn.Module):
 
 
 class LayerBudgetController(nn.Module):
-    def __init__(self, num_chunk_layers):
+    def __init__(self, num_chunk_layers, freeze_budget=True):
         super().__init__()
         self.num_chunk_layers = num_chunk_layers
+        self.freeze_budget = freeze_budget
         
         # 可学习参数：每一层争夺"剩余预算"的权重，什么初始化合理，能给softmax合适的分布？
-        self.layer_logits = nn.Parameter(torch.ones(num_chunk_layers) * 10.0)
+        self.layer_logits = nn.Parameter(torch.zeros(num_chunk_layers))
 
 
     def forward(self, total_budget):
@@ -112,6 +129,18 @@ class LayerBudgetController(nn.Module):
             budget_val = total_budget.float() # 保持梯度图（虽然通常它是常数）
         else:
             budget_val = torch.tensor(float(total_budget), device=self.layer_logits.device)
+
+        if self.freeze_budget:
+            # Uniform allocation
+            budget_per_layer = budget_val / self.num_chunk_layers
+            final_budgets = torch.full(
+                (self.num_chunk_layers,), 
+                budget_per_layer, 
+                device=self.layer_logits.device
+            )
+            # Uniform probs for logging
+            probs = torch.ones_like(self.layer_logits) / self.num_chunk_layers
+            return final_budgets, probs
 
         # 确保总预算至少能覆盖每层 1 个 (Base Constraint)
         # 使用 clamp 替代 if-else，代码更简洁且兼容 Tensor 操作
@@ -163,4 +192,4 @@ class LayerBudgetController(nn.Module):
         # 最终预算 = 基础预算(1) + 剩余分配(>=0)
         final_budgets = 1.0 + allocated_residual_ste
         
-        return final_budgets
+        return final_budgets, probs

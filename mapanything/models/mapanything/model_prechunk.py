@@ -1667,7 +1667,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             width=chunked_states[0].width,
         )
         # get layer budget
-        layer_budgets = self.layer_budget_controller((num_chunks * len(self.view_compressions)) / 2)
+        layer_budgets, layer_budget_probs = self.layer_budget_controller((num_chunks * len(self.view_compressions)) / 2)
 
         # Step 4: Merged phase - 将所有chunks合并处理剩余的transformer层
         final_info_sharing_multi_view_feat, merged_intermediate_multi_view_features = self.info_sharing(
@@ -1770,6 +1770,7 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
             scale_head_inputs = (
                 final_info_sharing_multi_view_feat.additional_token_features
             )
+            chunk_embeddings = getattr(final_info_sharing_multi_view_feat, "chunk_embeddings", None)
 
             # Run the downstream heads
             dense_final_outputs, pose_final_outputs, scale_final_output = (
@@ -2070,6 +2071,10 @@ class MapAnythingPrechunk(nn.Module, PyTorchModelHubMixin):
                 for i in range(num_views):
                     res[i]["non_ambiguous_mask"] = output_masks_per_view[i]
                     res[i]["non_ambiguous_mask_logits"] = output_mask_logits_per_view[i]
+
+            # Add chunk embeddings to the first view for loss computation
+            if chunk_embeddings is not None and len(res) > 0:
+                res[0]["chunk_embeddings"] = chunk_embeddings
 
         return res
 
